@@ -1,0 +1,13 @@
+version: v2
+inputs:
+  - git_repo: https://github.com/esachser/omnimeshcontrol.git
+    branch: main
+    subdir: api/proto
+    depth: 1
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: api/gen
+    opt: paths=source_relative
+  - remote: buf.build/grpc/go
+    out: api/gen
+    opt: paths=source_relative
