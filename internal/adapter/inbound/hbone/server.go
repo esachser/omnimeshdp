@@ -46,9 +46,14 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve serves HTTP/2 HBONE connections on the provided pre-opened listener.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.listener = ln
 
-	log.Printf("Proxy HBONE server running on %s...\n", s.addr)
+	log.Printf("Proxy HBONE server running on %s...\n", ln.Addr().String())
 
 	errCh := make(chan error, 1)
 	go func() {

@@ -9,7 +9,7 @@ import (
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
 )
 
-func createPacketProcessor(useWinDivert bool, useWfp bool) (outbound.PacketProcessor, error) {
+func createPacketProcessor(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
 	log.Println("Running on non-Windows system: using NoOpProcessor.")
 	return noop.NewNoOpProcessor(), nil
 }

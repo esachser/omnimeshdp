@@ -15,7 +15,7 @@ var _ outbound.PacketProcessor = (*WfpProcessor)(nil)
 
 type WfpProcessor struct{}
 
-func NewWfpProcessor(config model.ProxyConfig) (*WfpProcessor, error) {
+func NewWfpProcessor(config []model.ProxyConfig) (*WfpProcessor, error) {
 	return nil, errors.New("WFP is only supported on Windows")
 }
 

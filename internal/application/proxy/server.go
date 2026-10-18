@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"net"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
 	"github.com/esachser/omnimeshdp/internal/port/inbound"
@@ -28,3 +29,9 @@ func NewServerSideService(listenAddr string) *ServerSideService {
 func (s *ServerSideService) Start(ctx context.Context) error {
 	return s.server.Start(ctx)
 }
+
+// Serve serves traffic on the provided listener until context cancellation.
+func (s *ServerSideService) Serve(ctx context.Context, ln net.Listener) error {
+	return s.server.Serve(ctx, ln)
+}
+

@@ -17,4 +17,16 @@ var (
 
 	// ErrInvalidDestination indicates missing or malformed real destination header.
 	ErrInvalidDestination = errors.New("invalid or missing destination header")
+
+	// Startup step errors per spec/run-start.md
+	ErrConfigLoadFailed              = errors.New("step 1 failed: could not load configuration")
+	ErrSpireConnectionFailed         = errors.New("step 2 failed: could not connect to spire agent for mTLS")
+	ErrPortBindFailed                = errors.New("step 3 failed: could not open internal/external ports")
+	ErrControlPlaneConnectionFailed  = errors.New("step 4 failed: could not connect to control plane")
+	ErrInitialScopeSnapshotFailed    = errors.New("step 5 failed: could not receive initial scope snapshot")
+	ErrSubnetsConfigFailed           = errors.New("step 6 failed: invalid or missing namespace subnets")
+	ErrPacketProcessorInitFailed     = errors.New("step 7 failed: could not configure packet processor filtering")
+	ErrDeployServicesFailed          = errors.New("step 8 failed: could not read services to deploy")
+	ErrControlPlaneStreamingFailed   = errors.New("step 9 failed: control plane streaming interrupted")
 )
+

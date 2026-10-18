@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -21,6 +22,7 @@ type ClientSideService struct {
 	targetHost      string
 	packetProcessor outbound.PacketProcessor
 	hboneClient     *hbone.Client
+	router          *Router
 }
 
 // NewClientSideService constructs a new ClientSideService.
@@ -48,15 +50,30 @@ func NewClientSideService(
 	}
 }
 
+// SetRouter configures the dynamic route table provider.
+func (s *ClientSideService) SetRouter(r *Router) {
+	s.router = r
+}
+
+// SetPacketProcessor updates the packet processor.
+func (s *ClientSideService) SetPacketProcessor(p outbound.PacketProcessor) {
+	s.packetProcessor = p
+}
+
 // Start begins accepting local connections and tunneling them over HBONE.
 func (s *ClientSideService) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to bind client-side listener on %s: %w", s.listenAddr, err)
 	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve accepts connections on the provided pre-opened listener.
+func (s *ClientSideService) Serve(ctx context.Context, ln net.Listener) error {
 	defer ln.Close()
 
-	log.Printf("Proxy HBONE client listening on %s...\n", s.listenAddr)
+	log.Printf("Proxy HBONE client listening on %s...\n", ln.Addr().String())
 
 	go func() {
 		<-ctx.Done()
@@ -66,6 +83,9 @@ func (s *ClientSideService) Start(ctx context.Context) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			select {
 			case <-ctx.Done():
 				return nil
@@ -94,30 +114,45 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 		}
 	}
 
-	pktInfo, err := s.packetProcessor.GetOriginalPacketInfo(peerAddr, socketHandle)
-	if err != nil || pktInfo == nil {
-		log.Printf("Could not retrieve original packet info for peer %s: %v\n", peerAddr, err)
-		return
+	var identity string
+	targetHost := s.targetHost
+	realDest := "172.27.153.78:8000"
+
+	if s.packetProcessor != nil {
+		pktInfo, err := s.packetProcessor.GetOriginalPacketInfo(peerAddr, socketHandle)
+		if err != nil || pktInfo == nil {
+			log.Printf("Could not retrieve original packet info for peer %s: %v\n", peerAddr, err)
+			return
+		}
+
+		identity, _ = s.packetProcessor.GetIdentityByPID(pktInfo.PID)
+
+		if pktInfo.IP != 0 {
+			destIP := fmt.Sprintf("%d.%d.%d.%d",
+				byte(pktInfo.IP>>24), byte(pktInfo.IP>>16), byte(pktInfo.IP>>8), byte(pktInfo.IP),
+			)
+			realDest = fmt.Sprintf("%s:%d", destIP, pktInfo.Port)
+
+			if s.router != nil {
+				resolved := s.router.ResolveRoute(destIP, pktInfo.Port, s.targetHost)
+				if resolved != nil {
+					targetHost = resolved.TargetHost
+					realDest = resolved.RealDest
+				}
+			}
+		}
 	}
 
-	identity, _ := s.packetProcessor.GetIdentityByPID(pktInfo.PID)
-
 	log.Printf(
-		"Establishing HBONE tunnel to %s with identity %q for caller on port %s\n",
-		s.targetHost,
+		"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s)\n",
+		targetHost,
 		identity,
 		peerAddr.String(),
+		realDest,
 	)
 
-	realDest := "172.27.153.78:8000"
-	// if pktInfo.IP != 0 && pktInfo.Port != 0 {
-	// 	realDest = fmt.Sprintf("%d.%d.%d.%d:%d",
-	// 		byte(pktInfo.IP>>24), byte(pktInfo.IP>>16), byte(pktInfo.IP>>8), byte(pktInfo.IP),
-	// 		pktInfo.Port,
-	// 	)
-	// }
-
-	if err := s.hboneClient.Tunnel(ctx, localConn, s.targetHost, realDest, identity); err != nil {
+	if err := s.hboneClient.Tunnel(ctx, localConn, targetHost, realDest, identity); err != nil {
 		log.Printf("Tunnel error: %v\n", err)
 	}
 }
+
