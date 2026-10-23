@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"sync"
 	"testing"
 
 	omnimeshv1 "github.com/esachser/omnimeshcontrol/api/gen/omnimesh/v1"
@@ -142,3 +143,119 @@ func TestRouter_ApplyUpdate(t *testing.T) {
 		t.Errorf("expected fallback TargetHost after removal, got %s", removedRoute.TargetHost)
 	}
 }
+
+func TestRouter_ConcurrentAccess(t *testing.T) {
+	router := proxy.NewRouter()
+
+	// Seed with an initial snapshot
+	router.ApplySnapshot(&omnimeshv1.ScopeSnapshot{
+		Services: []*omnimeshv1.ServiceInfo{
+			{
+				Namespace: "default",
+				Name:      "service-0",
+				MeshAddr:  "10.0.0.1",
+				Port:      8080,
+			},
+		},
+		Routes: []*omnimeshv1.RouteInfo{
+			{
+				Namespace:   "default",
+				ServiceName: "service-0",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{
+						NodeId:        "node-0",
+						Addr:          "192.168.1.1:15008",
+						TargetAddress: "10.0.0.1:8080",
+					},
+				},
+			},
+		},
+	})
+
+	var readerWg sync.WaitGroup
+	var writerWg sync.WaitGroup
+	stopCh := make(chan struct{})
+
+	// Launch reader goroutines continuously resolving routes
+	for i := 0; i < 10; i++ {
+		readerWg.Add(1)
+		go func(readerID int) {
+			defer readerWg.Done()
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+					route := router.ResolveRoute("10.0.0.1", 8080, "fallback:15008")
+					if route == nil {
+						t.Errorf("reader %d got nil route", readerID)
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Launch writer goroutines modifying/updating routes
+	for i := 0; i < 4; i++ {
+		writerWg.Add(1)
+		go func(writerID int) {
+			defer writerWg.Done()
+			for j := 0; j < 50; j++ {
+				router.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+					Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_MODIFY,
+					Services: []*omnimeshv1.ServiceInfo{
+						{
+							Namespace: "default",
+							Name:      "service-0",
+							MeshAddr:  "10.0.0.1",
+							Port:      8080,
+						},
+					},
+					Routes: []*omnimeshv1.RouteInfo{
+						{
+							Namespace:   "default",
+							ServiceName: "service-0",
+							TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+								{
+									NodeId:        "node-1",
+									Addr:          "192.168.1.2:15008",
+									TargetAddress: "10.0.0.1:8080",
+								},
+							},
+						},
+					},
+				})
+
+				router.ApplySnapshot(&omnimeshv1.ScopeSnapshot{
+					Services: []*omnimeshv1.ServiceInfo{
+						{
+							Namespace: "default",
+							Name:      "service-0",
+							MeshAddr:  "10.0.0.1",
+							Port:      8080,
+						},
+					},
+					Routes: []*omnimeshv1.RouteInfo{
+						{
+							Namespace:   "default",
+							ServiceName: "service-0",
+							TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+								{
+									NodeId:        "node-0",
+									Addr:          "192.168.1.1:15008",
+									TargetAddress: "10.0.0.1:8080",
+								},
+							},
+						},
+					},
+				})
+			}
+		}(i)
+	}
+
+	// Wait for writers to complete, then signal readers to stop
+	writerWg.Wait()
+	close(stopCh)
+	readerWg.Wait()
+}
+

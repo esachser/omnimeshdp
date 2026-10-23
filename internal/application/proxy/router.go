@@ -10,34 +10,61 @@ import (
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 )
 
-/**
-TODO: Create a full update on every cycle.
-With that, we can reduce the lock contention.
-
-How it should work:
+/*
+Full update on every cycle implementation.
+Reduces lock contention by using copy-on-write routing tables:
 1. Receive full or partial snapshot.
-2. Create working copy of the config
+2. Create working copy of the config.
 3. Apply updates to working copy.
 4. Commit working copy to main config.
 
-That way, we need lock to update snapshot,
-but only a reduced lock to get the pointer
-to the main map for ResolveRoute.
+Lock is required to serialize snapshot/update operations,
+but only a reduced read lock is needed to get the pointer
+to the main config for ResolveRoute.
 */
+
+// routeConfig stores the routing tables for services and routes.
+// Once committed to Router, instances of routeConfig are immutable.
+type routeConfig struct {
+	services map[string]*omnimeshv1.ServiceInfo // key: "meshAddr:port" and "meshAddr"
+	routes   map[string]*omnimeshv1.RouteInfo   // key: "namespace/serviceName"
+}
+
+// newRouteConfig allocates a new, empty routeConfig.
+func newRouteConfig() *routeConfig {
+	return &routeConfig{
+		services: make(map[string]*omnimeshv1.ServiceInfo),
+		routes:   make(map[string]*omnimeshv1.RouteInfo),
+	}
+}
+
+// clone creates a shallow copy of the routeConfig maps.
+func (c *routeConfig) clone() *routeConfig {
+	copy := newRouteConfig()
+	if c == nil {
+		return copy
+	}
+	for k, v := range c.services {
+		copy.services[k] = v
+	}
+	for k, v := range c.routes {
+		copy.routes[k] = v
+	}
+	return copy
+}
 
 // Router maintains mesh routing tables derived from ScopeSnapshot and ScopeUpdate messages.
 type Router struct {
+	updateMu          sync.Mutex
 	mu                sync.RWMutex
-	services          map[string]*omnimeshv1.ServiceInfo // key: "meshAddr:port"
-	routes            map[string]*omnimeshv1.RouteInfo   // key: "namespace/serviceName"
+	config            *routeConfig
 	roundRobinCounter uint64
 }
 
 // NewRouter creates a new thread-safe mesh router.
 func NewRouter() *Router {
 	return &Router{
-		services: make(map[string]*omnimeshv1.ServiceInfo),
-		routes:   make(map[string]*omnimeshv1.RouteInfo),
+		config: newRouteConfig(),
 	}
 }
 
@@ -47,25 +74,32 @@ func (r *Router) ApplySnapshot(snapshot *omnimeshv1.ScopeSnapshot) {
 		return
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
 
-	r.services = make(map[string]*omnimeshv1.ServiceInfo)
-	r.routes = make(map[string]*omnimeshv1.RouteInfo)
+	// 1. Receive full snapshot.
+	// 2. Create working copy of the config.
+	workingCopy := newRouteConfig()
 
+	// 3. Apply updates to working copy.
 	for _, svc := range snapshot.Services {
 		key := fmt.Sprintf("%s:%d", svc.MeshAddr, svc.Port)
-		r.services[key] = svc
+		workingCopy.services[key] = svc
 		// Also index by MeshAddr alone for fallback matching
-		if _, exists := r.services[svc.MeshAddr]; !exists {
-			r.services[svc.MeshAddr] = svc
+		if _, exists := workingCopy.services[svc.MeshAddr]; !exists {
+			workingCopy.services[svc.MeshAddr] = svc
 		}
 	}
 
 	for _, route := range snapshot.Routes {
 		key := fmt.Sprintf("%s/%s", route.Namespace, route.ServiceName)
-		r.routes[key] = route
+		workingCopy.routes[key] = route
 	}
+
+	// 4. Commit working copy to main config.
+	r.mu.Lock()
+	r.config = workingCopy
+	r.mu.Unlock()
 
 	log.Printf("Router: ScopeSnapshot applied with %d services and %d routes\n",
 		len(snapshot.Services), len(snapshot.Routes))
@@ -77,33 +111,47 @@ func (r *Router) ApplyUpdate(update *omnimeshv1.ScopeUpdate) {
 		return
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
 
+	// 1. Receive partial snapshot / update.
+	// 2. Create working copy of the config.
+	r.mu.RLock()
+	current := r.config
+	r.mu.RUnlock()
+
+	workingCopy := current.clone()
+
+	// 3. Apply updates to working copy.
 	switch update.Type {
 	case omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE:
 		for _, svc := range update.Services {
 			key := fmt.Sprintf("%s:%d", svc.MeshAddr, svc.Port)
-			delete(r.services, key)
-			delete(r.services, svc.MeshAddr)
+			delete(workingCopy.services, key)
+			delete(workingCopy.services, svc.MeshAddr)
 		}
 		for _, route := range update.Routes {
 			key := fmt.Sprintf("%s/%s", route.Namespace, route.ServiceName)
-			delete(r.routes, key)
+			delete(workingCopy.routes, key)
 		}
 	default: // ADD or MODIFY
 		for _, svc := range update.Services {
 			key := fmt.Sprintf("%s:%d", svc.MeshAddr, svc.Port)
-			r.services[key] = svc
-			if _, exists := r.services[svc.MeshAddr]; !exists {
-				r.services[svc.MeshAddr] = svc
+			workingCopy.services[key] = svc
+			if _, exists := workingCopy.services[svc.MeshAddr]; !exists {
+				workingCopy.services[svc.MeshAddr] = svc
 			}
 		}
 		for _, route := range update.Routes {
 			key := fmt.Sprintf("%s/%s", route.Namespace, route.ServiceName)
-			r.routes[key] = route
+			workingCopy.routes[key] = route
 		}
 	}
+
+	// 4. Commit working copy to main config.
+	r.mu.Lock()
+	r.config = workingCopy
+	r.mu.Unlock()
 
 	log.Printf("Router: ScopeUpdate (%v) applied with %d services and %d routes\n",
 		update.Type, len(update.Services), len(update.Routes))
@@ -111,17 +159,26 @@ func (r *Router) ApplyUpdate(update *omnimeshv1.ScopeUpdate) {
 
 // ResolveRoute resolves the HBONE target host and real destination endpoint for intercepted traffic.
 func (r *Router) ResolveRoute(destIP string, destPort uint16, defaultTargetHost string) *model.ResolvedRoute {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	fallbackRealDest := fmt.Sprintf("%s:%d", destIP, destPort)
+
+	// Acquire reduced read lock solely to get pointer to current routing config
+	r.mu.RLock()
+	cfg := r.config
+	r.mu.RUnlock()
+
+	if cfg == nil {
+		return &model.ResolvedRoute{
+			TargetHost: defaultTargetHost,
+			RealDest:   fallbackRealDest,
+		}
+	}
 
 	// Try matching by exact "IP:Port"
 	keyWithPort := fmt.Sprintf("%s:%d", destIP, destPort)
-	svc, ok := r.services[keyWithPort]
+	svc, ok := cfg.services[keyWithPort]
 	if !ok {
 		// Fallback match by IP
-		svc, ok = r.services[destIP]
+		svc, ok = cfg.services[destIP]
 	}
 
 	if !ok {
@@ -132,7 +189,7 @@ func (r *Router) ResolveRoute(destIP string, destPort uint16, defaultTargetHost 
 	}
 
 	routeKey := fmt.Sprintf("%s/%s", svc.Namespace, svc.Name)
-	route, routeOk := r.routes[routeKey]
+	route, routeOk := cfg.routes[routeKey]
 	if !routeOk || len(route.TargetNodes) == 0 {
 		return &model.ResolvedRoute{
 			TargetHost: defaultTargetHost,
