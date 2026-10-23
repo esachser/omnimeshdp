@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,10 +51,13 @@ type mockControlPlaneClient struct {
 	registerCalled       bool
 	snapshotErr          error
 	snapshotToReturn     *omnimeshv1.ScopeSnapshot
+	reconnectSnapshot    *omnimeshv1.ScopeSnapshot
 	sendServicesCalled   bool
 	servicesSent         []model.NodeServiceInfo
 	streamUpdatesCalled  bool
 	closeCalled          bool
+	failStreamCount      int32
+	streamErrToReturn    error
 }
 
 func (m *mockControlPlaneClient) Connect(ctx context.Context) error {
@@ -69,6 +73,9 @@ func (m *mockControlPlaneClient) RegisterAndGetSnapshot(ctx context.Context, reg
 	m.registerCalled = true
 	if m.snapshotErr != nil {
 		return nil, m.snapshotErr
+	}
+	if m.reconnectSnapshot != nil && m.streamUpdatesCalled {
+		return m.reconnectSnapshot, nil
 	}
 	if m.snapshotToReturn != nil {
 		return m.snapshotToReturn, nil
@@ -95,6 +102,15 @@ func (m *mockControlPlaneClient) StreamUpdates(ctx context.Context, onUpdate fun
 	m.mu.Lock()
 	m.streamUpdatesCalled = true
 	m.mu.Unlock()
+
+	if atomic.LoadInt32(&m.failStreamCount) > 0 {
+		atomic.AddInt32(&m.failStreamCount, -1)
+		if m.streamErrToReturn != nil {
+			return m.streamErrToReturn
+		}
+		return errors.New("stream connection lost")
+	}
+
 	<-ctx.Done()
 	return nil
 }
@@ -408,5 +424,83 @@ func TestOrchestrator_Step7_PacketProcessorFailed(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrPacketProcessorInitFailed) {
 		t.Errorf("expected ErrPacketProcessorInitFailed, got: %v", err)
+	}
+}
+
+func TestOrchestrator_ControlPlaneReconnectOnStreamFailure(t *testing.T) {
+	cfg := validTestConfig()
+	mockProc := &mockPacketProcessor{}
+
+	reconnectSnap := &omnimeshv1.ScopeSnapshot{
+		Services: []*omnimeshv1.ServiceInfo{
+			{Namespace: "default", Name: "reconnected-svc", MeshAddr: "10.20.20.1", Port: 8080},
+		},
+		Routes: []*omnimeshv1.RouteInfo{
+			{
+				Namespace:   "default",
+				ServiceName: "reconnected-svc",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{Addr: "192.168.1.100:15008", TargetAddress: "127.0.0.1:8080"},
+				},
+			},
+		},
+	}
+
+	mockCP := &mockControlPlaneClient{
+		failStreamCount:   1, // Stream drops once during Step 9, triggering reconnect
+		reconnectSnapshot: reconnectSnap,
+	}
+
+	orch := orchestrator.NewOrchestrator(
+		orchestrator.WithConfig(cfg),
+		orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+			return mockProc, nil
+		}),
+		orchestrator.WithTLSFactory(func(ctx context.Context, socketPath, serverSVID string) (outbound.TLSConfigProvider, io.Closer, error) {
+			return &mockTLSProvider{}, io.NopCloser(nil), nil
+		}),
+		orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+			return mockCP
+		}),
+		orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+			return newMockListener(address), nil
+		}),
+		orchestrator.WithRetryInterval(10*time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- orch.Run(ctx)
+	}()
+
+	// Wait for startup and reconnect to happen
+	var resolved *model.ResolvedRoute
+	for i := 0; i < 20; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if router := orch.Router(); router != nil {
+			r := router.ResolveRoute("10.20.20.1", 8080, "fallback")
+			if r.TargetHost == "192.168.1.100:15008" {
+				resolved = r
+				break
+			}
+		}
+	}
+
+	if resolved == nil {
+		t.Fatalf("expected router to have updated route for reconnected-svc after reconnect")
+	}
+
+	// Trigger clean shutdown
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil error on shutdown after reconnect, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for orchestrator shutdown after reconnect")
 	}
 }

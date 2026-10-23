@@ -33,10 +33,11 @@ type ListenersConfig struct {
 
 // ControlPlaneConfig holds connection information for omnimeshcontrol.
 type ControlPlaneConfig struct {
-	Address string            `json:"address"`
-	NodeID  string            `json:"node_id"`
-	Target  string            `json:"target"`
-	Labels  map[string]string `json:"labels"`
+	Address       string            `json:"address"`
+	NodeID        string            `json:"node_id"`
+	Target        string            `json:"target"`
+	Labels        map[string]string `json:"labels"`
+	RetryInterval string            `json:"retry_interval"` // Reconnection backoff interval, e.g. "5s"
 }
 
 // InterceptionConfig holds packet interception configuration.
@@ -58,9 +59,10 @@ func DefaultConfig() *AppConfig {
 			ExternalAddr: "0.0.0.0:15008",
 		},
 		ControlPlane: ControlPlaneConfig{
-			Address: "https://127.0.0.1:9091",
-			NodeID:  "node-1",
-			Target:  "default",
+			Address:       "https://127.0.0.1:9091",
+			NodeID:        "node-1",
+			Target:        "default",
+			RetryInterval: "5s",
 		},
 		Interception: InterceptionConfig{
 			Type: "wfp",
@@ -117,6 +119,9 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 	}
 	if target := os.Getenv("NETWORK_TARGET"); target != "" {
 		cfg.ControlPlane.Target = target
+	}
+	if cpRetry := os.Getenv("CONTROL_PLANE_RETRY_INTERVAL"); cpRetry != "" {
+		cfg.ControlPlane.RetryInterval = cpRetry
 	}
 	if interceptType := os.Getenv("INTERCEPTION_TYPE"); interceptType != "" {
 		cfg.Interception.Type = interceptType

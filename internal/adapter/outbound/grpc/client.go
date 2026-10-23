@@ -25,6 +25,7 @@ type Client struct {
 	conn              *grpc.ClientConn
 	stream            omnimeshv1.AgentService_AgentStreamClient
 	mu                sync.Mutex
+	onSnapshot        func(*omnimeshv1.ScopeSnapshot)
 }
 
 // NewClient constructs a new control plane gRPC client.
@@ -35,10 +36,23 @@ func NewClient(addr string, tlsConfigProvider outbound.TLSConfigProvider) *Clien
 	}
 }
 
+// SetSnapshotHandler registers a callback invoked when a ScopeSnapshot is received during streaming.
+func (c *Client) SetSnapshotHandler(handler func(*omnimeshv1.ScopeSnapshot)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onSnapshot = handler
+}
+
 // Connect dials the control plane and establishes the bidirectional AgentStream.
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+		c.stream = nil
+	}
 
 	log.Printf("Connecting to Control Plane at %s...\n", c.addr)
 
@@ -181,9 +195,13 @@ func (c *Client) StreamUpdates(ctx context.Context, onUpdate func(*omnimeshv1.Sc
 
 	for {
 		resp, err := stream.Recv()
-		if err == io.EOF || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			log.Println("Control Plane stream closed.")
 			return nil
+		}
+		if err == io.EOF {
+			log.Println("Control Plane stream closed by server.")
+			return io.EOF
 		}
 		if err != nil {
 			log.Printf("Control Plane stream error: %v\n", err)
@@ -198,6 +216,12 @@ func (c *Client) StreamUpdates(ctx context.Context, onUpdate func(*omnimeshv1.Sc
 		case *omnimeshv1.AgentStreamResponse_ScopeSnapshot:
 			log.Printf("Received additional ScopeSnapshot with %d services, %d routes\n",
 				len(payload.ScopeSnapshot.Services), len(payload.ScopeSnapshot.Routes))
+			c.mu.Lock()
+			sh := c.onSnapshot
+			c.mu.Unlock()
+			if sh != nil {
+				sh(payload.ScopeSnapshot)
+			}
 		default:
 			log.Printf("Received message from Control Plane: %v\n", resp)
 		}

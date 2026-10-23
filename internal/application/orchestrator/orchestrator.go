@@ -43,6 +43,7 @@ type Orchestrator struct {
 	tlsFactory       TLSProviderFactory
 	cpClientFactory  ControlPlaneClientFactory
 	listenerOpener   ListenerOpener
+	retryInterval    time.Duration
 
 	// Internal state across steps
 	tlsProvider        outbound.TLSConfigProvider
@@ -101,6 +102,13 @@ func WithControlPlaneClientFactory(fn ControlPlaneClientFactory) Option {
 func WithListenerOpener(fn ListenerOpener) Option {
 	return func(o *Orchestrator) {
 		o.listenerOpener = fn
+	}
+}
+
+// WithRetryInterval sets the backoff duration for control plane reconnection.
+func WithRetryInterval(interval time.Duration) Option {
+	return func(o *Orchestrator) {
+		o.retryInterval = interval
 	}
 }
 
@@ -209,6 +217,16 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.config.ControlPlane.NodeID,
 		o.config.ControlPlane.Target,
 	)
+	if o.retryInterval > 0 {
+		o.controlPlaneAgent.SetRetryInterval(o.retryInterval)
+	} else if o.config.ControlPlane.RetryInterval != "" {
+		if d, err := time.ParseDuration(o.config.ControlPlane.RetryInterval); err == nil && d > 0 {
+			o.controlPlaneAgent.SetRetryInterval(d)
+		}
+	}
+	if len(o.config.ControlPlane.Labels) > 0 {
+		o.controlPlaneAgent.SetLabels(o.config.ControlPlane.Labels)
+	}
 
 	if err := o.controlPlaneAgent.Connect(ctx); err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrControlPlaneConnectionFailed, err)
@@ -224,6 +242,12 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	o.router.ApplySnapshot(snapshot)
 	log.Printf("[Step 5/10] ScopeSnapshot processed: %d services, %d routes.\n",
 		len(snapshot.Services), len(snapshot.Routes))
+
+	o.controlPlaneAgent.SetSnapshotHandler(func(newSnapshot *omnimeshv1.ScopeSnapshot) {
+		log.Printf("Router: applying updated ScopeSnapshot received upon reconnect (%d services, %d routes)\n",
+			len(newSnapshot.Services), len(newSnapshot.Routes))
+		o.router.ApplySnapshot(newSnapshot)
+	})
 
 	// Step 6: Read namespace subnets from the configuration file.
 	log.Println("[Step 6/10] Reading namespace subnets from configuration file...")
@@ -339,4 +363,11 @@ func (o *Orchestrator) Cleanup() {
 	case <-time.After(5 * time.Second):
 		log.Println("Cleanup timeout exceeded while waiting for background goroutines.")
 	}
+}
+
+// Router returns the mesh Router used by the Orchestrator.
+func (o *Orchestrator) Router() *proxy.Router {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.router
 }
