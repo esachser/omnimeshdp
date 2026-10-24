@@ -1,0 +1,38 @@
+{
+  "spire": {
+    "socket_path": "/run/spire/sockets/agent.sock",
+    "server_svid": "spiffe://omnimesh.local/ns/omnimesh-system/sa/omnimeshcontrol",
+    "disabled": false
+  },
+  "listeners": {
+    "internal_addr": "127.0.0.1:15001",
+    "external_addr": "0.0.0.0:15008"
+  },
+  "control_plane": {
+    "address": "https://127.0.0.1:9091",
+    "node_id": "linux-node-test",
+    "target": "default",
+    "retry_interval": "5s",
+    "labels": {
+      "os": "linux",
+      "env": "test"
+    }
+  },
+  "interception": {
+    "type": "auto",
+    "subnets": [
+      "10.10.10.0/24",
+      "10.10.12.0/24"
+    ]
+  },
+  "services": [
+    {
+      "namespace": "default",
+      "name": "sample-service",
+      "id": "linux-sample-1",
+      "labels": {
+        "app": "sample"
+      }
+    }
+  ]
+}

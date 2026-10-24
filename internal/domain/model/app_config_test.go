@@ -114,3 +114,25 @@ func TestConfigValidation(t *testing.T) {
 		t.Errorf("expected validation error for invalid CIDR")
 	}
 }
+
+func TestConfigDirFiles(t *testing.T) {
+	configFiles := []string{
+		"../../../config/config.test.json",
+		"../../../config/config.windows.json",
+		"../../../config/config.linux.json",
+	}
+
+	for _, relPath := range configFiles {
+		absPath, err := filepath.Abs(relPath)
+		if err != nil {
+			t.Fatalf("failed to resolve path %s: %v", relPath, err)
+		}
+		cfg, err := model.LoadConfig(absPath)
+		if err != nil {
+			t.Fatalf("expected %s to load without error, got: %v", filepath.Base(relPath), err)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected %s to be valid, got: %v", filepath.Base(relPath), err)
+		}
+	}
+}
