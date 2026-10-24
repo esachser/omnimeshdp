@@ -504,3 +504,82 @@ func TestOrchestrator_ControlPlaneReconnectOnStreamFailure(t *testing.T) {
 		t.Fatalf("timeout waiting for orchestrator shutdown after reconnect")
 	}
 }
+
+// Mock PacketProcessor that also supports runtime subnet updates.
+type mockUpdatableProcessor struct {
+	mockPacketProcessor
+	mu      sync.Mutex
+	updates [][]string
+}
+
+func (m *mockUpdatableProcessor) UpdateSubnets(subnets []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.updates = append(m.updates, subnets)
+	return nil
+}
+
+func runOrchestratorWithProcessor(t *testing.T, proc outbound.PacketProcessor) (*orchestrator.Orchestrator, context.CancelFunc, chan error) {
+	t.Helper()
+	cfg := validTestConfig()
+	cfg.Spire.Disabled = true
+
+	orch := orchestrator.NewOrchestrator(
+		orchestrator.WithConfig(cfg),
+		orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+			return proc, nil
+		}),
+		orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+			return &mockControlPlaneClient{}
+		}),
+		orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+			return newMockListener(address), nil
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- orch.Run(ctx)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	return orch, cancel, errCh
+}
+
+func TestOrchestrator_UpdateInterceptionSubnets(t *testing.T) {
+	proc := &mockUpdatableProcessor{}
+	orch, cancel, errCh := runOrchestratorWithProcessor(t, proc)
+
+	newSubnets := []string{"10.20.0.0/16"}
+	if err := orch.UpdateInterceptionSubnets(newSubnets); err != nil {
+		t.Fatalf("unexpected error updating subnets: %v", err)
+	}
+
+	proc.mu.Lock()
+	if len(proc.updates) != 1 || len(proc.updates[0]) != 1 || proc.updates[0][0] != "10.20.0.0/16" {
+		t.Errorf("expected processor to receive %v, got %v", newSubnets, proc.updates)
+	}
+	proc.mu.Unlock()
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("expected nil error on shutdown, got: %v", err)
+	}
+
+	if err := orch.UpdateInterceptionSubnets(newSubnets); err == nil {
+		t.Errorf("expected error when updating subnets after shutdown")
+	}
+}
+
+func TestOrchestrator_UpdateInterceptionSubnets_Unsupported(t *testing.T) {
+	orch, cancel, errCh := runOrchestratorWithProcessor(t, &mockPacketProcessor{})
+	defer func() {
+		cancel()
+		<-errCh
+	}()
+
+	err := orch.UpdateInterceptionSubnets([]string{"10.20.0.0/16"})
+	if !errors.Is(err, domain.ErrSubnetUpdateUnsupported) {
+		t.Fatalf("expected ErrSubnetUpdateUnsupported, got: %v", err)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/esachser/omnimeshdp/internal/adapter/sockmark"
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"golang.org/x/net/http2"
 )
@@ -24,7 +25,8 @@ func NewClient() *Client {
 	transport := &http2.Transport{
 		AllowHTTP: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			var d net.Dialer
+			// Mark proxy-originated sockets so Linux redirect rules skip them (no-op elsewhere).
+			d := net.Dialer{Control: sockmark.Control(sockmark.ProxyMark)}
 			return d.DialContext(ctx, network, addr)
 		},
 	}

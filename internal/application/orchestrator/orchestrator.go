@@ -274,7 +274,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrPacketProcessorInitFailed, err)
 	}
+	o.mu.Lock()
 	o.packetProcessor = processor
+	o.mu.Unlock()
 	o.clientSideService.SetPacketProcessor(processor)
 
 	o.wg.Add(1)
@@ -370,4 +372,31 @@ func (o *Orchestrator) Router() *proxy.Router {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.router
+}
+
+// UpdateInterceptionSubnets replaces the intercepted subnets while running, without
+// restarting the packet processor. It returns domain.ErrSubnetUpdateUnsupported if
+// the active processor cannot be updated at runtime.
+func (o *Orchestrator) UpdateInterceptionSubnets(subnets []string) error {
+	o.mu.Lock()
+	processor := o.packetProcessor
+	stopped := o.stopped
+	o.mu.Unlock()
+
+	if stopped || processor == nil {
+		return fmt.Errorf("cannot update intercepted subnets: packet processor is not running")
+	}
+	updater, ok := processor.(outbound.SubnetUpdater)
+	if !ok {
+		return fmt.Errorf("%w: %T", domain.ErrSubnetUpdateUnsupported, processor)
+	}
+	if err := updater.UpdateSubnets(subnets); err != nil {
+		return fmt.Errorf("failed to update intercepted subnets: %w", err)
+	}
+
+	o.mu.Lock()
+	o.config.Interception.Subnets = append([]string(nil), subnets...)
+	o.mu.Unlock()
+	log.Printf("Intercepted subnets updated: %v\n", subnets)
+	return nil
 }

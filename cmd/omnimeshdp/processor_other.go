@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package main
 
@@ -10,6 +10,6 @@ import (
 )
 
 func createPacketProcessor(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
-	log.Println("Running on non-Windows system: using NoOpProcessor.")
+	log.Println("Running on a system without packet interception support: using NoOpProcessor.")
 	return noop.NewNoOpProcessor(), nil
 }

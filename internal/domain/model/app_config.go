@@ -42,7 +42,7 @@ type ControlPlaneConfig struct {
 
 // InterceptionConfig holds packet interception configuration.
 type InterceptionConfig struct {
-	Type    string   `json:"type"`    // "wfp", "windivert", "noop"
+	Type    string   `json:"type"`    // Windows: "wfp", "windivert"; Linux: "auto", "nftables", "iptables"; any: "noop"
 	Subnets []string `json:"subnets"` // e.g. ["10.10.10.0/24", "10.10.12.0/24"]
 }
 

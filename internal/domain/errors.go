@@ -18,6 +18,9 @@ var (
 	// ErrInvalidDestination indicates missing or malformed real destination header.
 	ErrInvalidDestination = errors.New("invalid or missing destination header")
 
+	// ErrSubnetUpdateUnsupported indicates the active packet processor cannot change intercepted subnets at runtime.
+	ErrSubnetUpdateUnsupported = errors.New("packet processor does not support runtime subnet updates")
+
 	// Startup step errors per spec/run-start.md
 	ErrConfigLoadFailed              = errors.New("step 1 failed: could not load configuration")
 	ErrSpireConnectionFailed         = errors.New("step 2 failed: could not connect to spire agent for mTLS")

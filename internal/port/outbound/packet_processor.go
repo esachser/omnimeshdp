@@ -21,3 +21,13 @@ type PacketProcessor interface {
 	// Close terminates packet interception and cleans up resources.
 	Close() error
 }
+
+// SubnetUpdater is an optional capability of a PacketProcessor that can replace
+// the set of intercepted subnets while running, without restarting interception.
+// Implementations must apply the change atomically: traffic is either matched by
+// the old set or by the new set, never by neither.
+type SubnetUpdater interface {
+	// UpdateSubnets replaces the intercepted IPv4 CIDR subnets. An empty slice
+	// removes every redirection while keeping the processor running.
+	UpdateSubnets(subnets []string) error
+}

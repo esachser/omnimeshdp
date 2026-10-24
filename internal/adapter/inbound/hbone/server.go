@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/esachser/omnimeshdp/internal/adapter/sockmark"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -87,8 +88,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dial target real destination
-	targetConn, err := net.DialTimeout("tcp", realDest, 5*time.Second)
+	// Dial target real destination. The socket is marked so Linux redirect rules
+	// don't send it back into the proxy (no-op on other platforms).
+	dialer := net.Dialer{Timeout: 5 * time.Second, Control: sockmark.Control(sockmark.ProxyMark)}
+	targetConn, err := dialer.Dial("tcp", realDest)
 	if err != nil {
 		log.Printf("Failed to connect to real destination at %s: %v\n", realDest, err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
