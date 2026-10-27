@@ -133,18 +133,22 @@ func (c *Client) RegisterAndGetSnapshot(ctx context.Context, reg *model.NodeRegi
 	}
 	log.Println("Sent initial RegisterNode request to Control Plane.")
 
-	resp, err := stream.Recv()
-	if err != nil {
-		return nil, fmt.Errorf("failed to receive initial ScopeSnapshot: %w", err)
-	}
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			return nil, fmt.Errorf("failed to receive initial ScopeSnapshot: %w", err)
+		}
 
-	switch payload := resp.Payload.(type) {
-	case *omnimeshv1.AgentStreamResponse_ScopeSnapshot:
-		log.Printf("Initial ScopeSnapshot received with %d services, %d routes\n",
-			len(payload.ScopeSnapshot.Services), len(payload.ScopeSnapshot.Routes))
-		return payload.ScopeSnapshot, nil
-	default:
-		return nil, fmt.Errorf("unexpected initial message from Control Plane: %T", resp.Payload)
+		switch payload := resp.Payload.(type) {
+		case *omnimeshv1.AgentStreamResponse_ScopeSnapshot:
+			log.Printf("Initial ScopeSnapshot received with %d services, %d routes\n",
+				len(payload.ScopeSnapshot.Services), len(payload.ScopeSnapshot.Routes))
+			return payload.ScopeSnapshot, nil
+		case *omnimeshv1.AgentStreamResponse_ScopeUpdate:
+			log.Println("Ignoring ScopeUpdate received before initial ScopeSnapshot.")
+		default:
+			return nil, fmt.Errorf("unexpected initial message from Control Plane: %T", resp.Payload)
+		}
 	}
 }
 
