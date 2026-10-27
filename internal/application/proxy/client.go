@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
@@ -20,6 +21,7 @@ var _ inbound.ProxyService = (*ClientSideService)(nil)
 type ClientSideService struct {
 	listenAddr      string
 	targetHost      string
+	mu              sync.RWMutex
 	packetProcessor outbound.PacketProcessor
 	hboneClient     *hbone.Client
 	router          *Router
@@ -52,11 +54,15 @@ func NewClientSideService(
 
 // SetRouter configures the dynamic route table provider.
 func (s *ClientSideService) SetRouter(r *Router) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.router = r
 }
 
 // SetPacketProcessor updates the packet processor.
 func (s *ClientSideService) SetPacketProcessor(p outbound.PacketProcessor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.packetProcessor = p
 }
 
@@ -118,14 +124,19 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	targetHost := s.targetHost
 	realDest := "172.27.153.78:8000"
 
-	if s.packetProcessor != nil {
-		pktInfo, err := s.packetProcessor.GetOriginalPacketInfo(peerAddr, socketHandle)
+	s.mu.RLock()
+	processor := s.packetProcessor
+	router := s.router
+	s.mu.RUnlock()
+
+	if processor != nil {
+		pktInfo, err := processor.GetOriginalPacketInfo(peerAddr, socketHandle)
 		if err != nil || pktInfo == nil {
 			log.Printf("Could not retrieve original packet info for peer %s: %v\n", peerAddr, err)
 			return
 		}
 
-		identity, _ = s.packetProcessor.GetIdentityByPID(pktInfo.PID)
+		identity, _ = processor.GetIdentityByPID(pktInfo.PID)
 
 		if pktInfo.IP != 0 {
 			destIP := fmt.Sprintf("%d.%d.%d.%d",
@@ -133,8 +144,8 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 			)
 			realDest = fmt.Sprintf("%s:%d", destIP, pktInfo.Port)
 
-			if s.router != nil {
-				resolved := s.router.ResolveRoute(destIP, pktInfo.Port, s.targetHost)
+			if router != nil {
+				resolved := router.ResolveRoute(destIP, pktInfo.Port, s.targetHost)
 				if resolved != nil {
 					targetHost = resolved.TargetHost
 					realDest = resolved.RealDest

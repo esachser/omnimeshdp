@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -46,6 +47,8 @@ type Orchestrator struct {
 	retryInterval    time.Duration
 
 	// Internal state across steps
+	runCtx             context.Context
+	internalPort       uint16
 	tlsProvider        outbound.TLSConfigProvider
 	tlsCloser          io.Closer
 	internalListener   net.Listener
@@ -56,11 +59,15 @@ type Orchestrator struct {
 	controlPlaneAgent  *agent.ControlPlaneAgent
 	router             *proxy.Router
 	packetProcessor    outbound.PacketProcessor
+	processorCancel    context.CancelFunc
+	processorDone      chan struct{}
+	currentSubnets     []string
 	servicesToDeploy   []model.NodeServiceInfo
 
-	wg      sync.WaitGroup
-	stopped bool
-	mu      sync.Mutex
+	processorMu sync.Mutex
+	wg          sync.WaitGroup
+	stopped     bool
+	mu          sync.Mutex
 }
 
 // WithConfigPath sets the path to the configuration file.
@@ -141,6 +148,10 @@ func NewOrchestrator(opts ...Option) *Orchestrator {
 // It fails fast and returns an error if any step fails.
 func (o *Orchestrator) Run(ctx context.Context) error {
 	defer o.Cleanup()
+
+	o.mu.Lock()
+	o.runCtx = ctx
+	o.mu.Unlock()
 
 	// Step 1: Read configuration from file or env.
 	log.Println("[Step 1/10] Reading configuration from file or env...")
@@ -240,22 +251,25 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		return fmt.Errorf("%w: %v", domain.ErrInitialScopeSnapshotFailed, err)
 	}
 	o.router.ApplySnapshot(snapshot)
-	log.Printf("[Step 5/10] ScopeSnapshot processed: %d services, %d routes.\n",
-		len(snapshot.Services), len(snapshot.Routes))
+	log.Printf("[Step 5/10] ScopeSnapshot processed: %d services, %d routes, %d namespaces.\n",
+		len(snapshot.Services), len(snapshot.Routes), len(snapshot.Namespaces))
 
 	o.controlPlaneAgent.SetSnapshotHandler(func(newSnapshot *omnimeshv1.ScopeSnapshot) {
-		log.Printf("Router: applying updated ScopeSnapshot received upon reconnect (%d services, %d routes)\n",
-			len(newSnapshot.Services), len(newSnapshot.Routes))
+		log.Printf("Router: applying updated ScopeSnapshot received upon reconnect (%d services, %d routes, %d namespaces)\n",
+			len(newSnapshot.Services), len(newSnapshot.Routes), len(newSnapshot.Namespaces))
 		o.router.ApplySnapshot(newSnapshot)
+		if err := o.syncPacketProcessorSubnets(o.router.Subnets()); err != nil {
+			log.Printf("Failed to update packet processor subnets from ScopeSnapshot: %v\n", err)
+		}
 	})
 
-	// Step 6: Read namespace subnets from the configuration file.
-	log.Println("[Step 6/10] Reading namespace subnets from configuration file...")
-	subnets := o.config.Interception.Subnets
-	if len(subnets) == 0 {
-		return fmt.Errorf("%w: no subnets specified in configuration", domain.ErrSubnetsConfigFailed)
+	// Step 6: Extract namespace subnets from the initial ScopeSnapshot.
+	log.Println("[Step 6/10] Extracting namespace subnets from ScopeSnapshot...")
+	subnets := o.router.Subnets()
+	if err := validateSubnets(subnets); err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrSubnetsConfigFailed, err)
 	}
-	log.Printf("[Step 6/10] Loaded %d namespace subnets: %v\n", len(subnets), subnets)
+	log.Printf("[Step 6/10] Loaded %d namespace subnets from Control Plane: %v\n", len(subnets), subnets)
 
 	// Step 7: Use packet processsor to configure packet filtering.
 	log.Println("[Step 7/10] Using packet processor to configure packet filtering...")
@@ -266,26 +280,16 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			internalPort = uint16(p)
 		}
 	}
+	o.mu.Lock()
+	o.internalPort = internalPort
+	o.mu.Unlock()
 
 	if o.processorFactory == nil {
 		return fmt.Errorf("%w: processor factory not configured", domain.ErrPacketProcessorInitFailed)
 	}
-	processor, err := o.processorFactory(o.config.Interception.Type, subnets, internalPort)
-	if err != nil {
+	if err := o.syncPacketProcessorSubnets(subnets); err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrPacketProcessorInitFailed, err)
 	}
-	o.mu.Lock()
-	o.packetProcessor = processor
-	o.mu.Unlock()
-	o.clientSideService.SetPacketProcessor(processor)
-
-	o.wg.Add(1)
-	go func() {
-		defer o.wg.Done()
-		if err := processor.Run(ctx); err != nil {
-			log.Printf("Packet processor stopped: %v\n", err)
-		}
-	}()
 	log.Println("[Step 7/10] Packet filtering configured and processor running.")
 
 	// Step 8: Read from config and files what services to deploy.
@@ -308,6 +312,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		defer o.wg.Done()
 		err := o.controlPlaneAgent.StreamUpdates(ctx, func(update *omnimeshv1.ScopeUpdate) {
 			o.router.ApplyUpdate(update)
+			if len(update.Namespaces) > 0 {
+				if err := o.syncPacketProcessorSubnets(o.router.Subnets()); err != nil {
+					log.Printf("Failed to update packet processor subnets from ScopeUpdate: %v\n", err)
+				}
+			}
 		})
 		if err != nil && ctx.Err() == nil {
 			streamErrCh <- err
@@ -336,10 +345,15 @@ func (o *Orchestrator) Cleanup() {
 		return
 	}
 	o.stopped = true
+	proc := o.packetProcessor
+	procCancel := o.processorCancel
 	o.mu.Unlock()
 
-	if o.packetProcessor != nil {
-		_ = o.packetProcessor.Close()
+	if procCancel != nil {
+		procCancel()
+	}
+	if proc != nil {
+		_ = proc.Close()
 	}
 	if o.internalListener != nil {
 		_ = o.internalListener.Close()
@@ -374,10 +388,27 @@ func (o *Orchestrator) Router() *proxy.Router {
 	return o.router
 }
 
+// Subnets returns a copy of the currently intercepted subnets.
+func (o *Orchestrator) Subnets() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.currentSubnets...)
+}
+
+// PacketProcessor returns the currently active PacketProcessor, or nil if none is running.
+func (o *Orchestrator) PacketProcessor() outbound.PacketProcessor {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.packetProcessor
+}
+
 // UpdateInterceptionSubnets replaces the intercepted subnets while running, without
 // restarting the packet processor. It returns domain.ErrSubnetUpdateUnsupported if
 // the active processor cannot be updated at runtime.
 func (o *Orchestrator) UpdateInterceptionSubnets(subnets []string) error {
+	o.processorMu.Lock()
+	defer o.processorMu.Unlock()
+
 	o.mu.Lock()
 	processor := o.packetProcessor
 	stopped := o.stopped
@@ -395,8 +426,185 @@ func (o *Orchestrator) UpdateInterceptionSubnets(subnets []string) error {
 	}
 
 	o.mu.Lock()
-	o.config.Interception.Subnets = append([]string(nil), subnets...)
+	o.currentSubnets = normalizeSubnetList(subnets)
 	o.mu.Unlock()
 	log.Printf("Intercepted subnets updated: %v\n", subnets)
 	return nil
+}
+
+// syncPacketProcessorSubnets updates the active packet processor to match the given
+// namespace subnets. If the running processor implements outbound.SubnetUpdater, its
+// subnets are updated in place; otherwise the processor is stopped and recreated via
+// processorFactory with the new subnets (or stopped if subnets is empty).
+func (o *Orchestrator) syncPacketProcessorSubnets(subnets []string) error {
+	normalized := normalizeSubnetList(subnets)
+	if err := validateSubnets(normalized); err != nil {
+		return err
+	}
+
+	o.processorMu.Lock()
+	defer o.processorMu.Unlock()
+
+	o.mu.Lock()
+	if o.stopped {
+		o.mu.Unlock()
+		return nil
+	}
+	currentProc := o.packetProcessor
+	sameSubnets := slices.Equal(normalized, o.currentSubnets)
+	o.mu.Unlock()
+
+	if sameSubnets && (len(normalized) == 0 || currentProc != nil) {
+		return nil
+	}
+
+	if len(normalized) == 0 {
+		if currentProc != nil {
+			if updater, ok := currentProc.(outbound.SubnetUpdater); ok {
+				if err := updater.UpdateSubnets(nil); err != nil {
+					return fmt.Errorf("failed to clear intercepted subnets: %w", err)
+				}
+				o.mu.Lock()
+				o.currentSubnets = nil
+				o.mu.Unlock()
+				log.Println("Intercepted subnets cleared (no active namespaces).")
+				return nil
+			}
+			o.stopProcessorLocked()
+		}
+		o.mu.Lock()
+		o.currentSubnets = nil
+		o.mu.Unlock()
+		log.Println("Packet processor idle (no active namespace subnets).")
+		return nil
+	}
+
+	if currentProc != nil {
+		if updater, ok := currentProc.(outbound.SubnetUpdater); ok {
+			if err := updater.UpdateSubnets(normalized); err != nil {
+				return fmt.Errorf("failed to update intercepted subnets: %w", err)
+			}
+			o.mu.Lock()
+			o.currentSubnets = normalized
+			o.mu.Unlock()
+			log.Printf("Intercepted subnets updated in-place: %v\n", normalized)
+			return nil
+		}
+		o.stopProcessorLocked()
+	}
+
+	if err := o.startProcessorLocked(normalized); err != nil {
+		return err
+	}
+	log.Printf("Packet processor configured with subnets: %v\n", normalized)
+	return nil
+}
+
+// stopProcessorLocked stops and closes the currently running packet processor.
+// Caller must hold o.processorMu.
+func (o *Orchestrator) stopProcessorLocked() {
+	o.mu.Lock()
+	proc := o.packetProcessor
+	cancel := o.processorCancel
+	done := o.processorDone
+	o.packetProcessor = nil
+	o.processorCancel = nil
+	o.processorDone = nil
+	svc := o.clientSideService
+	o.mu.Unlock()
+
+	if svc != nil {
+		svc.SetPacketProcessor(nil)
+	}
+	if cancel != nil {
+		cancel()
+	}
+	if proc != nil {
+		_ = proc.Close()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+// startProcessorLocked creates and starts a new packet processor for the given subnets.
+// Caller must hold o.processorMu.
+func (o *Orchestrator) startProcessorLocked(subnets []string) error {
+	o.mu.Lock()
+	if o.stopped {
+		o.mu.Unlock()
+		return nil
+	}
+	factory := o.processorFactory
+	interceptionType := o.config.Interception.Type
+	internalPort := o.internalPort
+	runCtx := o.runCtx
+	svc := o.clientSideService
+	o.mu.Unlock()
+
+	if factory == nil {
+		return fmt.Errorf("processor factory not configured")
+	}
+
+	processor, err := factory(interceptionType, subnets, internalPort)
+	if err != nil {
+		return err
+	}
+
+	procCtx, procCancel := context.WithCancel(runCtx)
+	procDone := make(chan struct{})
+
+	o.mu.Lock()
+	if o.stopped {
+		o.mu.Unlock()
+		procCancel()
+		_ = processor.Close()
+		return nil
+	}
+	o.packetProcessor = processor
+	o.processorCancel = procCancel
+	o.processorDone = procDone
+	o.currentSubnets = append([]string(nil), subnets...)
+	o.mu.Unlock()
+
+	if svc != nil {
+		svc.SetPacketProcessor(processor)
+	}
+
+	o.wg.Add(1)
+	go func() {
+		defer o.wg.Done()
+		defer close(procDone)
+		if err := processor.Run(procCtx); err != nil && procCtx.Err() == nil {
+			log.Printf("Packet processor stopped: %v\n", err)
+		}
+	}()
+
+	return nil
+}
+
+func validateSubnets(subnets []string) error {
+	for _, subnet := range subnets {
+		if _, _, err := net.ParseCIDR(subnet); err != nil {
+			return fmt.Errorf("invalid subnet CIDR %q: %w", subnet, err)
+		}
+	}
+	return nil
+}
+
+func normalizeSubnetList(subnets []string) []string {
+	if len(subnets) == 0 {
+		return nil
+	}
+	cp := make([]string, 0, len(subnets))
+	for _, s := range subnets {
+		if s != "" {
+			cp = append(cp, s)
+		}
+	}
+	if len(cp) == 0 {
+		return nil
+	}
+	slices.Sort(cp)
+	return slices.Compact(cp)
 }

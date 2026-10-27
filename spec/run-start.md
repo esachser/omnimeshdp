@@ -13,7 +13,7 @@ It must follow some steps and fail if any step fails.
    - The next step must only run after this one succeeds.
 1. Connect to the Control Plane using the mTLS configuration from step 2.
 1. Receive the inicial ScopeSnapshot and prepare routing config.
-1. Read namespace subnets from the configuration file.
+1. Extract namespace subnets from the initial ScopeSnapshot.
 1. Use packet processsor to configure packet filtering.
 1. Read from config and files what services to deploy.
 1. Send and receive updates to/from Control Plane and update routing config and packet filtering.

@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"slices"
 	"sync"
 	"testing"
 
@@ -258,4 +259,94 @@ func TestRouter_ConcurrentAccess(t *testing.T) {
 	close(stopCh)
 	readerWg.Wait()
 }
+
+func TestRouter_NamespacesAndSubnets(t *testing.T) {
+	router := proxy.NewRouter()
+
+	if got := router.Subnets(); len(got) != 0 {
+		t.Fatalf("expected empty subnets initially, got %v", got)
+	}
+
+	// 1. Initial snapshot with two namespaces
+	router.ApplySnapshot(&omnimeshv1.ScopeSnapshot{
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{
+				Name:    "ns-a",
+				Subnets: []string{"10.10.12.0/24", "10.10.10.0/24"},
+			},
+			{
+				Name: "ns-b",
+				Cidr: "10.10.20.0/24", // Fallback to Cidr when Subnets is empty
+			},
+		},
+	})
+
+	want := []string{"10.10.10.0/24", "10.10.12.0/24", "10.10.20.0/24"}
+	if got := router.Subnets(); !slices.Equal(got, want) {
+		t.Fatalf("expected subnets %v, got %v", want, got)
+	}
+	if gotNs := router.Namespaces(); len(gotNs) != 2 {
+		t.Fatalf("expected 2 namespaces, got %d", len(gotNs))
+	}
+
+	// 2. Add a new namespace via ScopeUpdate (ADD)
+	router.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_ADD,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{
+				Name:    "ns-c",
+				Subnets: []string{"10.10.30.0/24", "10.10.10.0/24"}, // duplicate subnet across namespaces
+			},
+		},
+	})
+
+	want = []string{"10.10.10.0/24", "10.10.12.0/24", "10.10.20.0/24", "10.10.30.0/24"}
+	if got := router.Subnets(); !slices.Equal(got, want) {
+		t.Fatalf("expected subnets after ADD %v, got %v", want, got)
+	}
+
+	// 3. Modify namespace ns-a via ScopeUpdate (MODIFY)
+	router.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_MODIFY,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{
+				Name:    "ns-a",
+				Subnets: []string{"10.10.15.0/24"},
+			},
+		},
+	})
+
+	// 10.10.10.0/24 is still kept because ns-c owns it; 10.10.12.0/24 is replaced by 10.10.15.0/24
+	want = []string{"10.10.10.0/24", "10.10.15.0/24", "10.10.20.0/24", "10.10.30.0/24"}
+	if got := router.Subnets(); !slices.Equal(got, want) {
+		t.Fatalf("expected subnets after MODIFY %v, got %v", want, got)
+	}
+
+	// 4. Remove namespace ns-c and ns-b via ScopeUpdate (REMOVE)
+	router.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-b"},
+			{Name: "ns-c"},
+		},
+	})
+
+	want = []string{"10.10.15.0/24"}
+	if got := router.Subnets(); !slices.Equal(got, want) {
+		t.Fatalf("expected subnets after REMOVE %v, got %v", want, got)
+	}
+
+	// 5. Remove last remaining namespace ns-a
+	router.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-a"},
+		},
+	})
+
+	if got := router.Subnets(); len(got) != 0 {
+		t.Fatalf("expected empty subnets after removing all namespaces, got %v", got)
+	}
+}
+
 

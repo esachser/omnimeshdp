@@ -42,8 +42,7 @@ type ControlPlaneConfig struct {
 
 // InterceptionConfig holds packet interception configuration.
 type InterceptionConfig struct {
-	Type    string   `json:"type"`    // Windows: "wfp", "windivert"; Linux: "auto", "nftables", "iptables"; any: "noop"
-	Subnets []string `json:"subnets"` // e.g. ["10.10.10.0/24", "10.10.12.0/24"]
+	Type string `json:"type"` // Windows: "wfp", "windivert"; Linux: "auto", "nftables", "iptables"; any: "noop"
 }
 
 // DefaultConfig returns default configuration values.
@@ -66,10 +65,6 @@ func DefaultConfig() *AppConfig {
 		},
 		Interception: InterceptionConfig{
 			Type: "wfp",
-			Subnets: []string{
-				"10.10.10.0/24",
-				"10.10.12.0/24",
-			},
 		},
 		Services: make([]NodeServiceInfo, 0),
 	}
@@ -126,18 +121,6 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 	if interceptType := os.Getenv("INTERCEPTION_TYPE"); interceptType != "" {
 		cfg.Interception.Type = interceptType
 	}
-	if subnetsEnv := os.Getenv("INTERCEPTION_SUBNETS"); subnetsEnv != "" {
-		var subnets []string
-		for _, s := range strings.Split(subnetsEnv, ",") {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				subnets = append(subnets, s)
-			}
-		}
-		if len(subnets) > 0 {
-			cfg.Interception.Subnets = subnets
-		}
-	}
 	if svcFile := os.Getenv("SERVICES_FILE"); svcFile != "" {
 		cfg.ServicesFile = svcFile
 	}
@@ -170,11 +153,6 @@ func (c *AppConfig) Validate() error {
 	}
 	if _, _, err := net.SplitHostPort(c.Listeners.ExternalAddr); err != nil {
 		return fmt.Errorf("invalid external listen address %q: %w", c.Listeners.ExternalAddr, err)
-	}
-	for _, subnet := range c.Interception.Subnets {
-		if _, _, err := net.ParseCIDR(subnet); err != nil {
-			return fmt.Errorf("invalid subnet CIDR %q: %w", subnet, err)
-		}
 	}
 	return nil
 }

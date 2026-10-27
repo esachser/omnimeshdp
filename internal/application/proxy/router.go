@@ -3,6 +3,8 @@ package proxy
 import (
 	"fmt"
 	"log"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -23,18 +25,20 @@ but only a reduced read lock is needed to get the pointer
 to the main config for ResolveRoute.
 */
 
-// routeConfig stores the routing tables for services and routes.
+// routeConfig stores the routing tables for services, routes, and namespaces.
 // Once committed to Router, instances of routeConfig are immutable.
 type routeConfig struct {
-	services map[string]*omnimeshv1.ServiceInfo // key: "meshAddr:port" and "meshAddr"
-	routes   map[string]*omnimeshv1.RouteInfo   // key: "namespace/serviceName"
+	services   map[string]*omnimeshv1.ServiceInfo   // key: "meshAddr:port" and "meshAddr"
+	routes     map[string]*omnimeshv1.RouteInfo     // key: "namespace/serviceName"
+	namespaces map[string]*omnimeshv1.NamespaceInfo // key: namespace name
 }
 
 // newRouteConfig allocates a new, empty routeConfig.
 func newRouteConfig() *routeConfig {
 	return &routeConfig{
-		services: make(map[string]*omnimeshv1.ServiceInfo),
-		routes:   make(map[string]*omnimeshv1.RouteInfo),
+		services:   make(map[string]*omnimeshv1.ServiceInfo),
+		routes:     make(map[string]*omnimeshv1.RouteInfo),
+		namespaces: make(map[string]*omnimeshv1.NamespaceInfo),
 	}
 }
 
@@ -50,7 +54,42 @@ func (c *routeConfig) clone() *routeConfig {
 	for k, v := range c.routes {
 		copy.routes[k] = v
 	}
+	for k, v := range c.namespaces {
+		copy.namespaces[k] = v
+	}
 	return copy
+}
+
+func namespaceKey(ns *omnimeshv1.NamespaceInfo) string {
+	if ns == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(ns.Name); name != "" {
+		return name
+	}
+	if cidr := strings.TrimSpace(ns.Cidr); cidr != "" {
+		return cidr
+	}
+	return strings.Join(ns.Subnets, ",")
+}
+
+func extractNamespaceSubnets(ns *omnimeshv1.NamespaceInfo) []string {
+	if ns == nil {
+		return nil
+	}
+	var out []string
+	for _, s := range ns.Subnets {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		if cidr := strings.TrimSpace(ns.Cidr); cidr != "" {
+			out = append(out, cidr)
+		}
+	}
+	return out
 }
 
 // Router maintains mesh routing tables derived from ScopeSnapshot and ScopeUpdate messages.
@@ -96,13 +135,19 @@ func (r *Router) ApplySnapshot(snapshot *omnimeshv1.ScopeSnapshot) {
 		workingCopy.routes[key] = route
 	}
 
+	for _, ns := range snapshot.Namespaces {
+		if key := namespaceKey(ns); key != "" {
+			workingCopy.namespaces[key] = ns
+		}
+	}
+
 	// 4. Commit working copy to main config.
 	r.mu.Lock()
 	r.config = workingCopy
 	r.mu.Unlock()
 
-	log.Printf("Router: ScopeSnapshot applied with %d services and %d routes\n",
-		len(snapshot.Services), len(snapshot.Routes))
+	log.Printf("Router: ScopeSnapshot applied with %d services, %d routes, and %d namespaces\n",
+		len(snapshot.Services), len(snapshot.Routes), len(snapshot.Namespaces))
 }
 
 // ApplyUpdate incrementally updates the routing table with a ScopeUpdate.
@@ -134,6 +179,11 @@ func (r *Router) ApplyUpdate(update *omnimeshv1.ScopeUpdate) {
 			key := fmt.Sprintf("%s/%s", route.Namespace, route.ServiceName)
 			delete(workingCopy.routes, key)
 		}
+		for _, ns := range update.Namespaces {
+			if key := namespaceKey(ns); key != "" {
+				delete(workingCopy.namespaces, key)
+			}
+		}
 	default: // ADD or MODIFY
 		for _, svc := range update.Services {
 			key := fmt.Sprintf("%s:%d", svc.MeshAddr, svc.Port)
@@ -146,6 +196,11 @@ func (r *Router) ApplyUpdate(update *omnimeshv1.ScopeUpdate) {
 			key := fmt.Sprintf("%s/%s", route.Namespace, route.ServiceName)
 			workingCopy.routes[key] = route
 		}
+		for _, ns := range update.Namespaces {
+			if key := namespaceKey(ns); key != "" {
+				workingCopy.namespaces[key] = ns
+			}
+		}
 	}
 
 	// 4. Commit working copy to main config.
@@ -153,8 +208,50 @@ func (r *Router) ApplyUpdate(update *omnimeshv1.ScopeUpdate) {
 	r.config = workingCopy
 	r.mu.Unlock()
 
-	log.Printf("Router: ScopeUpdate (%v) applied with %d services and %d routes\n",
-		update.Type, len(update.Services), len(update.Routes))
+	log.Printf("Router: ScopeUpdate (%v) applied with %d services, %d routes, and %d namespaces\n",
+		update.Type, len(update.Services), len(update.Routes), len(update.Namespaces))
+}
+
+// Subnets returns a sorted, deduplicated slice of CIDR subnets across all active namespaces.
+func (r *Router) Subnets() []string {
+	r.mu.RLock()
+	cfg := r.config
+	r.mu.RUnlock()
+
+	if cfg == nil || len(cfg.namespaces) == 0 {
+		return nil
+	}
+
+	var subnets []string
+	for _, ns := range cfg.namespaces {
+		subnets = append(subnets, extractNamespaceSubnets(ns)...)
+	}
+	if len(subnets) == 0 {
+		return nil
+	}
+
+	slices.Sort(subnets)
+	return slices.Compact(subnets)
+}
+
+// Namespaces returns the currently active namespaces sorted by name.
+func (r *Router) Namespaces() []*omnimeshv1.NamespaceInfo {
+	r.mu.RLock()
+	cfg := r.config
+	r.mu.RUnlock()
+
+	if cfg == nil || len(cfg.namespaces) == 0 {
+		return nil
+	}
+
+	out := make([]*omnimeshv1.NamespaceInfo, 0, len(cfg.namespaces))
+	for _, ns := range cfg.namespaces {
+		out = append(out, ns)
+	}
+	slices.SortFunc(out, func(a, b *omnimeshv1.NamespaceInfo) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+	return out
 }
 
 // ResolveRoute resolves the HBONE target host and real destination endpoint for intercepted traffic.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,12 +21,16 @@ import (
 
 // Mock PacketProcessor
 type mockPacketProcessor struct {
+	mu          sync.Mutex
+	subnets     []string
 	runCalled   bool
 	closeCalled bool
 }
 
 func (m *mockPacketProcessor) Run(ctx context.Context) error {
+	m.mu.Lock()
 	m.runCalled = true
+	m.mu.Unlock()
 	<-ctx.Done()
 	return nil
 }
@@ -39,8 +44,22 @@ func (m *mockPacketProcessor) GetOriginalPacketInfo(addr net.Addr, socket uintpt
 }
 
 func (m *mockPacketProcessor) Close() error {
+	m.mu.Lock()
 	m.closeCalled = true
+	m.mu.Unlock()
 	return nil
+}
+
+func (m *mockPacketProcessor) isRunCalled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runCalled
+}
+
+func (m *mockPacketProcessor) isCloseCalled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closeCalled
 }
 
 // Mock ControlPlaneClient
@@ -58,6 +77,7 @@ type mockControlPlaneClient struct {
 	closeCalled          bool
 	failStreamCount      int32
 	streamErrToReturn    error
+	updatesCh            chan *omnimeshv1.ScopeUpdate
 }
 
 func (m *mockControlPlaneClient) Connect(ctx context.Context) error {
@@ -87,6 +107,13 @@ func (m *mockControlPlaneClient) RegisterAndGetSnapshot(ctx context.Context, reg
 		Routes: []*omnimeshv1.RouteInfo{
 			{Namespace: "default", ServiceName: "svc1"},
 		},
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{
+				Name:    "default",
+				Cidr:    "10.10.10.0/24",
+				Subnets: []string{"10.10.10.0/24"},
+			},
+		},
 	}, nil
 }
 
@@ -101,6 +128,7 @@ func (m *mockControlPlaneClient) SendUpdateServices(ctx context.Context, service
 func (m *mockControlPlaneClient) StreamUpdates(ctx context.Context, onUpdate func(*omnimeshv1.ScopeUpdate)) error {
 	m.mu.Lock()
 	m.streamUpdatesCalled = true
+	updatesCh := m.updatesCh
 	m.mu.Unlock()
 
 	if atomic.LoadInt32(&m.failStreamCount) > 0 {
@@ -111,8 +139,20 @@ func (m *mockControlPlaneClient) StreamUpdates(ctx context.Context, onUpdate fun
 		return errors.New("stream connection lost")
 	}
 
-	<-ctx.Done()
-	return nil
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case upd, ok := <-updatesCh:
+			if !ok {
+				<-ctx.Done()
+				return nil
+			}
+			if onUpdate != nil {
+				onUpdate(upd)
+			}
+		}
+	}
 }
 
 func (m *mockControlPlaneClient) Run(ctx context.Context, reg *model.NodeRegistration) error {
@@ -170,7 +210,6 @@ func validTestConfig() *model.AppConfig {
 	cfg := model.DefaultConfig()
 	cfg.Spire.Disabled = false
 	cfg.Interception.Type = "noop"
-	cfg.Interception.Subnets = []string{"10.10.10.0/24"}
 	cfg.Services = []model.NodeServiceInfo{
 		{Namespace: "default", Name: "my-service", ID: "srv-1"},
 	}
@@ -184,10 +223,12 @@ func TestOrchestrator_FullSuccessfulFlow(t *testing.T) {
 
 	tlsFactoryCalled := false
 	tlsCloserClosed := false
+	var factorySubnets []string
 
 	orch := orchestrator.NewOrchestrator(
 		orchestrator.WithConfig(cfg),
 		orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+			factorySubnets = append([]string(nil), subnets...)
 			return mockProc, nil
 		}),
 		orchestrator.WithTLSFactory(func(ctx context.Context, socketPath, serverSVID string) (outbound.TLSConfigProvider, io.Closer, error) {
@@ -221,8 +262,11 @@ func TestOrchestrator_FullSuccessfulFlow(t *testing.T) {
 	if !mockCP.registerCalled {
 		t.Errorf("expected Control Plane RegisterAndGetSnapshot in Step 5")
 	}
-	if !mockProc.runCalled {
+	if !mockProc.isRunCalled() {
 		t.Errorf("expected PacketProcessor.Run in Step 7")
+	}
+	if !slices.Equal(factorySubnets, []string{"10.10.10.0/24"}) {
+		t.Errorf("expected processor factory to receive namespace subnets [10.10.10.0/24], got %v", factorySubnets)
 	}
 	if !mockCP.sendServicesCalled {
 		t.Errorf("expected SendUpdateServices in Step 9")
@@ -243,7 +287,7 @@ func TestOrchestrator_FullSuccessfulFlow(t *testing.T) {
 		t.Fatalf("timeout waiting for orchestrator shutdown")
 	}
 
-	if !mockProc.closeCalled {
+	if !mockProc.isCloseCalled() {
 		t.Errorf("expected PacketProcessor.Close on cleanup")
 	}
 	if !mockCP.closeCalled {
@@ -373,12 +417,20 @@ func TestOrchestrator_Step5_InitialSnapshotFailed(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_Step6_NoSubnetsFailed(t *testing.T) {
+func TestOrchestrator_Step6_InvalidNamespaceSubnetsFailed(t *testing.T) {
 	cfg := validTestConfig()
 	cfg.Spire.Disabled = true
-	cfg.Interception.Subnets = []string{} // empty subnets
 
-	mockCP := &mockControlPlaneClient{}
+	mockCP := &mockControlPlaneClient{
+		snapshotToReturn: &omnimeshv1.ScopeSnapshot{
+			Namespaces: []*omnimeshv1.NamespaceInfo{
+				{
+					Name:    "bad-ns",
+					Subnets: []string{"invalid-cidr"},
+				},
+			},
+		},
+	}
 
 	orch := orchestrator.NewOrchestrator(
 		orchestrator.WithConfig(cfg),
@@ -392,7 +444,7 @@ func TestOrchestrator_Step6_NoSubnetsFailed(t *testing.T) {
 
 	err := orch.Run(context.Background())
 	if err == nil {
-		t.Fatalf("expected error when subnets are empty")
+		t.Fatalf("expected error when namespace subnet CIDR is invalid")
 	}
 	if !errors.Is(err, domain.ErrSubnetsConfigFailed) {
 		t.Errorf("expected ErrSubnetsConfigFailed, got: %v", err)
@@ -583,3 +635,276 @@ func TestOrchestrator_UpdateInterceptionSubnets_Unsupported(t *testing.T) {
 		t.Fatalf("expected ErrSubnetUpdateUnsupported, got: %v", err)
 	}
 }
+
+func TestOrchestrator_DynamicNamespaceChanges_WithSubnetUpdater(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Spire.Disabled = true
+
+	proc := &mockUpdatableProcessor{}
+	updatesCh := make(chan *omnimeshv1.ScopeUpdate, 10)
+
+	mockCP := &mockControlPlaneClient{
+		snapshotToReturn: &omnimeshv1.ScopeSnapshot{
+			Namespaces: []*omnimeshv1.NamespaceInfo{
+				{
+					Name:    "ns-1",
+					Subnets: []string{"10.10.10.0/24"},
+				},
+			},
+		},
+		updatesCh: updatesCh,
+	}
+
+	var initialSubnets []string
+	orch := orchestrator.NewOrchestrator(
+		orchestrator.WithConfig(cfg),
+		orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+			initialSubnets = append([]string(nil), subnets...)
+			return proc, nil
+		}),
+		orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+			return mockCP
+		}),
+		orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+			return newMockListener(address), nil
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- orch.Run(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if !slices.Equal(initialSubnets, []string{"10.10.10.0/24"}) {
+		t.Fatalf("expected initial subnets [10.10.10.0/24], got %v", initialSubnets)
+	}
+	if !slices.Equal(orch.Subnets(), []string{"10.10.10.0/24"}) {
+		t.Fatalf("expected orch.Subnets() [10.10.10.0/24], got %v", orch.Subnets())
+	}
+
+	// 1. Add namespace ns-2
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_ADD,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{
+				Name:    "ns-2",
+				Subnets: []string{"10.10.12.0/24", "10.10.14.0/24"},
+			},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	want := []string{"10.10.10.0/24", "10.10.12.0/24", "10.10.14.0/24"}
+	if !slices.Equal(orch.Subnets(), want) {
+		t.Fatalf("expected orch.Subnets() after ADD %v, got %v", want, orch.Subnets())
+	}
+
+	// 2. Modify namespace ns-2
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_MODIFY,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{
+				Name:    "ns-2",
+				Subnets: []string{"10.10.16.0/24"},
+			},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	want = []string{"10.10.10.0/24", "10.10.16.0/24"}
+	if !slices.Equal(orch.Subnets(), want) {
+		t.Fatalf("expected orch.Subnets() after MODIFY %v, got %v", want, orch.Subnets())
+	}
+
+	// 3. Remove namespace ns-1
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-1"},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	want = []string{"10.10.16.0/24"}
+	if !slices.Equal(orch.Subnets(), want) {
+		t.Fatalf("expected orch.Subnets() after REMOVE ns-1 %v, got %v", want, orch.Subnets())
+	}
+
+	// 4. Remove last namespace ns-2
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-2"},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if len(orch.Subnets()) != 0 {
+		t.Fatalf("expected empty orch.Subnets() after removing all namespaces, got %v", orch.Subnets())
+	}
+
+	proc.mu.Lock()
+	if len(proc.updates) != 4 {
+		t.Fatalf("expected 4 UpdateSubnets calls on processor, got %d: %v", len(proc.updates), proc.updates)
+	}
+	if len(proc.updates[3]) != 0 {
+		t.Errorf("expected last UpdateSubnets call to have empty slice, got %v", proc.updates[3])
+	}
+	proc.mu.Unlock()
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("expected nil error on shutdown, got: %v", err)
+	}
+}
+
+func TestOrchestrator_DynamicNamespaceChanges_RecreatesProcessorWhenNotUpdatable(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Spire.Disabled = true
+
+	updatesCh := make(chan *omnimeshv1.ScopeUpdate, 10)
+
+	// Start with empty namespaces in initial ScopeSnapshot to also test starting from 0 namespaces
+	mockCP := &mockControlPlaneClient{
+		snapshotToReturn: &omnimeshv1.ScopeSnapshot{},
+		updatesCh:        updatesCh,
+	}
+
+	var mu sync.Mutex
+	var createdProcessors []*mockPacketProcessor
+
+	orch := orchestrator.NewOrchestrator(
+		orchestrator.WithConfig(cfg),
+		orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			p := &mockPacketProcessor{subnets: append([]string(nil), subnets...)}
+			createdProcessors = append(createdProcessors, p)
+			return p, nil
+		}),
+		orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+			return mockCP
+		}),
+		orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+			return newMockListener(address), nil
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- orch.Run(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Initially 0 namespaces -> no processor created yet
+	mu.Lock()
+	if len(createdProcessors) != 0 {
+		t.Fatalf("expected 0 processors when initial snapshot has no namespaces, got %d", len(createdProcessors))
+	}
+	mu.Unlock()
+	if orch.PacketProcessor() != nil {
+		t.Fatalf("expected nil PacketProcessor when no namespaces exist")
+	}
+
+	// 1. Add namespace ns-1 -> creates processor #1 with [10.10.10.0/24]
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_ADD,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-1", Subnets: []string{"10.10.10.0/24"}},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	if len(createdProcessors) != 1 {
+		t.Fatalf("expected 1 processor created after adding ns-1, got %d", len(createdProcessors))
+	}
+	proc1 := createdProcessors[0]
+	mu.Unlock()
+
+	if !proc1.isRunCalled() {
+		t.Errorf("expected proc1.Run to be called")
+	}
+	if !slices.Equal(proc1.subnets, []string{"10.10.10.0/24"}) {
+		t.Errorf("expected proc1 subnets [10.10.10.0/24], got %v", proc1.subnets)
+	}
+
+	// 2. Add namespace ns-2 -> closes proc1, creates processor #2 with [10.10.10.0/24, 10.10.12.0/24]
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_ADD,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-2", Subnets: []string{"10.10.12.0/24"}},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	if len(createdProcessors) != 2 {
+		t.Fatalf("expected 2 processors created after adding ns-2, got %d", len(createdProcessors))
+	}
+	proc2 := createdProcessors[1]
+	mu.Unlock()
+
+	if !proc1.isCloseCalled() {
+		t.Errorf("expected proc1.Close to be called when replaced by proc2")
+	}
+	if !proc2.isRunCalled() {
+		t.Errorf("expected proc2.Run to be called")
+	}
+	if !slices.Equal(proc2.subnets, []string{"10.10.10.0/24", "10.10.12.0/24"}) {
+		t.Errorf("expected proc2 subnets [10.10.10.0/24, 10.10.12.0/24], got %v", proc2.subnets)
+	}
+
+	// 3. Remove namespace ns-1 -> closes proc2, creates processor #3 with [10.10.12.0/24]
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-1"},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	if len(createdProcessors) != 3 {
+		t.Fatalf("expected 3 processors created after removing ns-1, got %d", len(createdProcessors))
+	}
+	proc3 := createdProcessors[2]
+	mu.Unlock()
+
+	if !proc2.isCloseCalled() {
+		t.Errorf("expected proc2.Close to be called when replaced by proc3")
+	}
+	if !proc3.isRunCalled() {
+		t.Errorf("expected proc3.Run to be called")
+	}
+	if !slices.Equal(proc3.subnets, []string{"10.10.12.0/24"}) {
+		t.Errorf("expected proc3 subnets [10.10.12.0/24], got %v", proc3.subnets)
+	}
+
+	// 4. Remove last namespace ns-2 -> closes proc3, sets PacketProcessor to nil
+	updatesCh <- &omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		Namespaces: []*omnimeshv1.NamespaceInfo{
+			{Name: "ns-2"},
+		},
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	if !proc3.isCloseCalled() {
+		t.Errorf("expected proc3.Close to be called when all namespaces are removed")
+	}
+	if orch.PacketProcessor() != nil {
+		t.Errorf("expected nil PacketProcessor after removing all namespaces")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("expected nil error on shutdown, got: %v", err)
+	}
+}
+

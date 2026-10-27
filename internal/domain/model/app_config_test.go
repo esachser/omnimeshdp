@@ -16,8 +16,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Listeners.ExternalAddr != "0.0.0.0:15008" {
 		t.Fatalf("unexpected external addr: %s", cfg.Listeners.ExternalAddr)
 	}
-	if len(cfg.Interception.Subnets) == 0 {
-		t.Fatalf("expected default subnets to not be empty")
+	if cfg.Interception.Type != "wfp" {
+		t.Fatalf("expected default interception type 'wfp', got %q", cfg.Interception.Type)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("default config should be valid: %v", err)
@@ -55,8 +55,7 @@ func TestLoadConfigFileAndEnv(t *testing.T) {
 			"target": "test-cluster"
 		},
 		"interception": {
-			"type": "noop",
-			"subnets": ["10.0.0.0/16", "172.16.0.0/12"]
+			"type": "noop"
 		},
 		"services_file": ` + `"` + filepath.ToSlash(servicesFile) + `"` + `
 	}`
@@ -75,8 +74,8 @@ func TestLoadConfigFileAndEnv(t *testing.T) {
 	if cfg.ControlPlane.NodeID != "test-node" {
 		t.Errorf("expected NodeID test-node, got %s", cfg.ControlPlane.NodeID)
 	}
-	if len(cfg.Interception.Subnets) != 2 {
-		t.Errorf("expected 2 subnets, got %d", len(cfg.Interception.Subnets))
+	if cfg.Interception.Type != "noop" {
+		t.Errorf("expected interception type 'noop', got %s", cfg.Interception.Type)
 	}
 	if len(cfg.Services) != 1 || cfg.Services[0].Name != "order-service" {
 		t.Errorf("expected loaded service 'order-service', got %v", cfg.Services)
@@ -84,7 +83,7 @@ func TestLoadConfigFileAndEnv(t *testing.T) {
 
 	// Test environment variable override
 	t.Setenv("NODE_ID", "env-override-node")
-	t.Setenv("INTERCEPTION_SUBNETS", "192.168.1.0/24")
+	t.Setenv("INTERCEPTION_TYPE", "windivert")
 
 	cfgWithEnv, err := model.LoadConfig(configFile)
 	if err != nil {
@@ -93,8 +92,8 @@ func TestLoadConfigFileAndEnv(t *testing.T) {
 	if cfgWithEnv.ControlPlane.NodeID != "env-override-node" {
 		t.Errorf("expected NodeID env-override-node, got %s", cfgWithEnv.ControlPlane.NodeID)
 	}
-	if len(cfgWithEnv.Interception.Subnets) != 1 || cfgWithEnv.Interception.Subnets[0] != "192.168.1.0/24" {
-		t.Errorf("expected overridden subnets, got %v", cfgWithEnv.Interception.Subnets)
+	if cfgWithEnv.Interception.Type != "windivert" {
+		t.Errorf("expected overridden interception type 'windivert', got %s", cfgWithEnv.Interception.Type)
 	}
 }
 
@@ -107,11 +106,11 @@ func TestConfigValidation(t *testing.T) {
 		t.Errorf("expected validation error for invalid internal_addr")
 	}
 
-	// Invalid CIDR
+	// Invalid external address
 	cfg = model.DefaultConfig()
-	cfg.Interception.Subnets = []string{"999.999.999.999/99"}
+	cfg.Listeners.ExternalAddr = "not-a-port"
 	if err := cfg.Validate(); err == nil {
-		t.Errorf("expected validation error for invalid CIDR")
+		t.Errorf("expected validation error for invalid external_addr")
 	}
 }
 
