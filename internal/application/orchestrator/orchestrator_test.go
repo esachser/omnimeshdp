@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -78,6 +81,8 @@ type mockControlPlaneClient struct {
 	failStreamCount      int32
 	streamErrToReturn    error
 	updatesCh            chan *omnimeshv1.ScopeUpdate
+	serviceUpdatesCh     chan []model.NodeServiceInfo
+	healthReportCh       chan *omnimeshv1.HealthReport
 }
 
 func (m *mockControlPlaneClient) Connect(ctx context.Context) error {
@@ -122,6 +127,28 @@ func (m *mockControlPlaneClient) SendUpdateServices(ctx context.Context, service
 	defer m.mu.Unlock()
 	m.sendServicesCalled = true
 	m.servicesSent = services
+	return nil
+}
+
+func (m *mockControlPlaneClient) SendServiceUpdates(ctx context.Context, added, removed []model.NodeServiceInfo) error {
+	m.mu.Lock()
+	m.sendServicesCalled = true
+	m.servicesSent = added
+	ch := m.serviceUpdatesCh
+	m.mu.Unlock()
+	if ch != nil && len(added) > 0 {
+		ch <- added
+	}
+	return nil
+}
+
+func (m *mockControlPlaneClient) SendHealthReport(ctx context.Context, report *omnimeshv1.HealthReport) error {
+	m.mu.Lock()
+	ch := m.healthReportCh
+	m.mu.Unlock()
+	if ch != nil {
+		ch <- report
+	}
 	return nil
 }
 
@@ -907,4 +934,116 @@ func TestOrchestrator_DynamicNamespaceChanges_RecreatesProcessorWhenNotUpdatable
 		t.Fatalf("expected nil error on shutdown, got: %v", err)
 	}
 }
+
+func TestOrchestratorDynamicServicesAndHealth(t *testing.T) {
+	tmpDir := t.TempDir()
+	servicesDir := filepath.Join(tmpDir, "services.d")
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		t.Fatalf("failed to create servicesDir: %v", err)
+	}
+
+	// Local listener for health check
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	mockCP := &mockControlPlaneClient{
+		snapshotToReturn: &omnimeshv1.ScopeSnapshot{
+			Namespaces: []*omnimeshv1.NamespaceInfo{
+				{Name: "default", Subnets: []string{"10.0.0.0/24"}},
+			},
+		},
+		serviceUpdatesCh: make(chan []model.NodeServiceInfo, 5),
+		healthReportCh:   make(chan *omnimeshv1.HealthReport, 5),
+	}
+
+	cfg := model.DefaultConfig()
+	cfg.Spire.Disabled = true
+	cfg.ServicesDir = servicesDir
+
+	orch := orchestrator.NewOrchestrator(
+		orchestrator.WithConfig(cfg),
+		orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+			return &mockPacketProcessor{subnets: subnets}, nil
+		}),
+		orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+			return mockCP
+		}),
+		orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+			return newMockListener(address), nil
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- orch.Run(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if orch.ServiceManager() == nil {
+		t.Fatalf("expected ServiceManager to be initialized")
+	}
+
+	// Drop a dynamic service file into services.d
+	svcFile := filepath.Join(servicesDir, "web.json")
+	svcJSON := fmt.Sprintf(`{
+		"namespace": "default",
+		"name": "web-svc",
+		"id": "web-1",
+		"health_check": {
+			"type": "TCP",
+			"address": %q,
+			"interval": "50ms",
+			"timeout": "50ms",
+			"healthy_threshold": 1,
+			"unhealthy_threshold": 1
+		}
+	}`, ln.Addr().String())
+
+	if err := os.WriteFile(svcFile, []byte(svcJSON), 0644); err != nil {
+		t.Fatalf("failed to write service file: %v", err)
+	}
+
+	// 1. Verify service update is advised to Control Plane
+	select {
+	case added := <-mockCP.serviceUpdatesCh:
+		if len(added) != 1 || added[0].Name != "web-svc" {
+			t.Fatalf("unexpected added services received: %v", added)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for service update event to control plane")
+	}
+
+	// 2. Verify health report is advised to Control Plane
+	select {
+	case hr := <-mockCP.healthReportCh:
+		if hr.ServiceName != "web-svc" || hr.Status != omnimeshv1.EndpointHealthStatus_ENDPOINT_HEALTH_STATUS_HEALTHY {
+			t.Fatalf("unexpected health report received: %+v", hr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for health report event to control plane")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("unexpected error on shutdown: %v", err)
+	}
+}
+
 

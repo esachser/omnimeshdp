@@ -31,6 +31,7 @@ type ControlPlaneAgent struct {
 	mu               sync.Mutex
 	lastExternalAddr string
 	lastServices     []model.NodeServiceInfo
+	lastHealth       map[string]*omnimeshv1.HealthReport
 	labels           map[string]string
 	onSnapshot       func(*omnimeshv1.ScopeSnapshot)
 	closeCh          chan struct{}
@@ -62,6 +63,7 @@ func NewControlPlaneAgent(client outbound.ControlPlaneClient) *ControlPlaneAgent
 		target:        target,
 		retryInterval: retryInterval,
 		labels:        make(map[string]string),
+		lastHealth:    make(map[string]*omnimeshv1.HealthReport),
 		closeCh:       make(chan struct{}),
 	}
 }
@@ -80,6 +82,7 @@ func NewControlPlaneAgentWithConfig(client outbound.ControlPlaneClient, nodeID, 
 		target:        target,
 		retryInterval: 5 * time.Second,
 		labels:        make(map[string]string),
+		lastHealth:    make(map[string]*omnimeshv1.HealthReport),
 		closeCh:       make(chan struct{}),
 	}
 }
@@ -169,6 +172,50 @@ func (a *ControlPlaneAgent) SendDeployedServices(ctx context.Context, services [
 	a.lastServices = services
 	a.mu.Unlock()
 	return a.client.SendUpdateServices(ctx, services)
+}
+
+// SendServiceUpdates sends added and removed services to the Control Plane and updates tracked services.
+func (a *ControlPlaneAgent) SendServiceUpdates(ctx context.Context, added, removed []model.NodeServiceInfo) error {
+	a.mu.Lock()
+	svcMap := make(map[string]model.NodeServiceInfo)
+	for _, s := range a.lastServices {
+		svcMap[s.Key()] = s
+	}
+	for _, s := range removed {
+		delete(svcMap, s.Key())
+		if a.lastHealth != nil {
+			// Clean up health for removed services
+			for k := range a.lastHealth {
+				if s.Key() == s.Namespace+"/"+s.Name+"/"+s.ID {
+					delete(a.lastHealth, k)
+				}
+			}
+		}
+	}
+	for _, s := range added {
+		svcMap[s.Key()] = s
+	}
+	newList := make([]model.NodeServiceInfo, 0, len(svcMap))
+	for _, s := range svcMap {
+		newList = append(newList, s)
+	}
+	a.lastServices = newList
+	a.mu.Unlock()
+
+	return a.client.SendServiceUpdates(ctx, added, removed)
+}
+
+// SendHealthReport sends an endpoint health status report to the Control Plane and tracks it.
+func (a *ControlPlaneAgent) SendHealthReport(ctx context.Context, report *omnimeshv1.HealthReport) error {
+	a.mu.Lock()
+	if a.lastHealth == nil {
+		a.lastHealth = make(map[string]*omnimeshv1.HealthReport)
+	}
+	key := report.Namespace + "/" + report.ServiceName + "/" + report.RouteName
+	a.lastHealth[key] = report
+	a.mu.Unlock()
+
+	return a.client.SendHealthReport(ctx, report)
 }
 
 // StreamUpdates streams updates from the Control Plane (Step 9).
@@ -269,6 +316,10 @@ func (a *ControlPlaneAgent) reconnect(ctx context.Context) error {
 		extAddr := a.lastExternalAddr
 		services := a.lastServices
 		snapshotHandler := a.onSnapshot
+		healthReports := make([]*omnimeshv1.HealthReport, 0, len(a.lastHealth))
+		for _, hr := range a.lastHealth {
+			healthReports = append(healthReports, hr)
+		}
 		a.mu.Unlock()
 
 		if extAddr == "" {
@@ -296,10 +347,18 @@ func (a *ControlPlaneAgent) reconnect(ctx context.Context) error {
 		// Re-send deployed services if any were previously registered
 		if len(services) > 0 {
 			log.Printf("[ControlPlaneAgent] Re-sending %d deployed services to Control Plane...\n", len(services))
-			if err := a.client.SendUpdateServices(ctx, services); err != nil {
+			if err := a.client.SendServiceUpdates(ctx, services, nil); err != nil {
 				log.Printf("[ControlPlaneAgent] Warning: failed to re-send deployed services after reconnect: %v\n", err)
 			} else {
 				log.Println("[ControlPlaneAgent] Successfully re-sent deployed services to Control Plane.")
+			}
+		}
+
+		// Re-send health reports if any were tracked
+		for _, hr := range healthReports {
+			if err := a.client.SendHealthReport(ctx, hr); err != nil {
+				log.Printf("[ControlPlaneAgent] Warning: failed to re-send health report for %s/%s after reconnect: %v\n",
+					hr.Namespace, hr.ServiceName, err)
 			}
 		}
 

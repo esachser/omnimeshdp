@@ -84,6 +84,20 @@ func (m *mockCPClient) SendUpdateServices(ctx context.Context, services []model.
 	return nil
 }
 
+func (m *mockCPClient) SendServiceUpdates(ctx context.Context, added, removed []model.NodeServiceInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sendServicesCalls++
+	m.sentServices = added
+	return nil
+}
+
+func (m *mockCPClient) SendHealthReport(ctx context.Context, report *omnimeshv1.HealthReport) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return nil
+}
+
 func (m *mockCPClient) StreamUpdates(ctx context.Context, onUpdate func(*omnimeshv1.ScopeUpdate)) error {
 	m.mu.Lock()
 	m.streamUpdatesCalls++

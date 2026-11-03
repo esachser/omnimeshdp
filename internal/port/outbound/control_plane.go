@@ -18,6 +18,12 @@ type ControlPlaneClient interface {
 	// SendUpdateServices sends updated deployed service definitions to the control plane.
 	SendUpdateServices(ctx context.Context, services []model.NodeServiceInfo) error
 
+	// SendServiceUpdates sends added and removed service definitions to the control plane.
+	SendServiceUpdates(ctx context.Context, added, removed []model.NodeServiceInfo) error
+
+	// SendHealthReport sends a service health status report to the control plane.
+	SendHealthReport(ctx context.Context, report *omnimeshv1.HealthReport) error
+
 	// StreamUpdates continuously consumes incoming ScopeUpdate messages until context completion.
 	StreamUpdates(ctx context.Context, onUpdate func(*omnimeshv1.ScopeUpdate)) error
 

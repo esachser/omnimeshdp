@@ -16,6 +16,7 @@ type AppConfig struct {
 	Interception InterceptionConfig `json:"interception"`
 	Services     []NodeServiceInfo  `json:"services"`
 	ServicesFile string             `json:"services_file"`
+	ServicesDir  string             `json:"services_dir"`
 }
 
 // SpireConfig holds configuration for the SPIFFE/SPIRE workload API agent.
@@ -66,7 +67,8 @@ func DefaultConfig() *AppConfig {
 		Interception: InterceptionConfig{
 			Type: "wfp",
 		},
-		Services: make([]NodeServiceInfo, 0),
+		Services:    make([]NodeServiceInfo, 0),
+		ServicesDir: "./services.d/",
 	}
 }
 
@@ -124,21 +126,29 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 	if svcFile := os.Getenv("SERVICES_FILE"); svcFile != "" {
 		cfg.ServicesFile = svcFile
 	}
+	if svcDir := os.Getenv("SERVICES_DIR"); svcDir != "" {
+		cfg.ServicesDir = svcDir
+	}
 
 	// 3. Read services file if specified
 	if cfg.ServicesFile != "" {
-		svcData, err := os.ReadFile(cfg.ServicesFile)
+		fileServices, err := ReadServicesFromFile(cfg.ServicesFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read services file %q: %w", cfg.ServicesFile, err)
-		}
-		var fileServices []NodeServiceInfo
-		if err := json.Unmarshal(svcData, &fileServices); err != nil {
-			return nil, fmt.Errorf("failed to parse services file %q: %w", cfg.ServicesFile, err)
+			return nil, err
 		}
 		cfg.Services = append(cfg.Services, fileServices...)
 	}
 
-	// 4. Validate configuration
+	// 4. Read services directory if specified
+	if cfg.ServicesDir != "" {
+		dirServices, err := ReadServicesFromDir(cfg.ServicesDir)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Services = MergeServices(cfg.Services, dirServices)
+	}
+
+	// 5. Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}

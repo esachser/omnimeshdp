@@ -18,3 +18,5 @@ go.work
 # IDEs
 .idea/
 .vscode/
+
+data/

@@ -16,6 +16,7 @@ import (
 	"github.com/esachser/omnimeshdp/internal/adapter/outbound/spiffe"
 	"github.com/esachser/omnimeshdp/internal/application/agent"
 	"github.com/esachser/omnimeshdp/internal/application/proxy"
+	"github.com/esachser/omnimeshdp/internal/application/service"
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
@@ -63,6 +64,7 @@ type Orchestrator struct {
 	processorDone      chan struct{}
 	currentSubnets     []string
 	servicesToDeploy   []model.NodeServiceInfo
+	serviceManager     *service.Manager
 
 	processorMu sync.Mutex
 	wg          sync.WaitGroup
@@ -294,8 +296,16 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	// Step 8: Read from config and files what services to deploy.
 	log.Println("[Step 8/10] Reading from config and files what services to deploy...")
-	o.servicesToDeploy = o.config.Services
-	log.Printf("[Step 8/10] Loaded %d services to deploy from config/files.\n", len(o.servicesToDeploy))
+	o.servicesToDeploy = append([]model.NodeServiceInfo(nil), o.config.Services...)
+	if o.config.ServicesDir != "" {
+		dirServices, err := model.ReadServicesFromDir(o.config.ServicesDir)
+		if err != nil {
+			log.Printf("[Step 8/10] Warning: failed to read services directory %q: %v\n", o.config.ServicesDir, err)
+		} else {
+			o.servicesToDeploy = model.MergeServices(o.servicesToDeploy, dirServices)
+		}
+	}
+	log.Printf("[Step 8/10] Loaded %d services to deploy from config/files/directory.\n", len(o.servicesToDeploy))
 
 	// Step 9: Send and receive updates to/from Control Plane and update routing config and packet filtering.
 	// - This should run until the application is stopped.
@@ -304,6 +314,20 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		if err := o.controlPlaneAgent.SendDeployedServices(ctx, o.servicesToDeploy); err != nil {
 			log.Printf("Warning: failed to send deployed services to Control Plane: %v\n", err)
 		}
+	}
+
+	// Start dynamic service manager (directory watcher and health probers)
+	svcMgr := service.NewManager(service.ManagerConfig{
+		ServicesDir:       o.config.ServicesDir,
+		InitialServices:   o.servicesToDeploy,
+		ControlPlaneAgent: o.controlPlaneAgent,
+	})
+	o.mu.Lock()
+	o.serviceManager = svcMgr
+	o.mu.Unlock()
+
+	if err := svcMgr.Start(ctx); err != nil {
+		log.Printf("[Step 9/10] Warning: failed to start dynamic service manager: %v\n", err)
 	}
 
 	streamErrCh := make(chan error, 1)
@@ -347,7 +371,13 @@ func (o *Orchestrator) Cleanup() {
 	o.stopped = true
 	proc := o.packetProcessor
 	procCancel := o.processorCancel
+	svcMgr := o.serviceManager
+	o.serviceManager = nil
 	o.mu.Unlock()
+
+	if svcMgr != nil {
+		_ = svcMgr.Close()
+	}
 
 	if procCancel != nil {
 		procCancel()
@@ -379,6 +409,13 @@ func (o *Orchestrator) Cleanup() {
 	case <-time.After(5 * time.Second):
 		log.Println("Cleanup timeout exceeded while waiting for background goroutines.")
 	}
+}
+
+// ServiceManager returns the dynamic ServiceManager used by the Orchestrator, or nil if not running.
+func (o *Orchestrator) ServiceManager() *service.Manager {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.serviceManager
 }
 
 // Router returns the mesh Router used by the Orchestrator.

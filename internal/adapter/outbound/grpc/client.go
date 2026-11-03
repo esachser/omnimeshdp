@@ -25,6 +25,7 @@ type Client struct {
 	conn              *grpc.ClientConn
 	stream            omnimeshv1.AgentService_AgentStreamClient
 	mu                sync.Mutex
+	sendMu            sync.Mutex
 	onSnapshot        func(*omnimeshv1.ScopeSnapshot)
 }
 
@@ -128,7 +129,10 @@ func (c *Client) RegisterAndGetSnapshot(ctx context.Context, reg *model.NodeRegi
 		},
 	}
 
-	if err := stream.Send(initReq); err != nil {
+	c.sendMu.Lock()
+	err := stream.Send(initReq)
+	c.sendMu.Unlock()
+	if err != nil {
 		return nil, fmt.Errorf("failed to send RegisterNode request: %w", err)
 	}
 	log.Println("Sent initial RegisterNode request to Control Plane.")
@@ -152,8 +156,8 @@ func (c *Client) RegisterAndGetSnapshot(ctx context.Context, reg *model.NodeRegi
 	}
 }
 
-// SendUpdateServices sends updated service definitions to the control plane.
-func (c *Client) SendUpdateServices(ctx context.Context, services []model.NodeServiceInfo) error {
+// SendServiceUpdates sends added and removed service definitions to the control plane.
+func (c *Client) SendServiceUpdates(ctx context.Context, added, removed []model.NodeServiceInfo) error {
 	c.mu.Lock()
 	stream := c.stream
 	c.mu.Unlock()
@@ -162,9 +166,19 @@ func (c *Client) SendUpdateServices(ctx context.Context, services []model.NodeSe
 		return fmt.Errorf("stream is not connected")
 	}
 
-	added := make([]*omnimeshv1.NodeServiceInfo, len(services))
-	for i, s := range services {
-		added[i] = &omnimeshv1.NodeServiceInfo{
+	addedProto := make([]*omnimeshv1.NodeServiceInfo, len(added))
+	for i, s := range added {
+		addedProto[i] = &omnimeshv1.NodeServiceInfo{
+			Namespace: s.Namespace,
+			Name:      s.Name,
+			Id:        s.ID,
+			Labels:    s.Labels,
+		}
+	}
+
+	removedProto := make([]*omnimeshv1.NodeServiceInfo, len(removed))
+	for i, s := range removed {
+		removedProto[i] = &omnimeshv1.NodeServiceInfo{
 			Namespace: s.Namespace,
 			Name:      s.Name,
 			Id:        s.ID,
@@ -175,15 +189,51 @@ func (c *Client) SendUpdateServices(ctx context.Context, services []model.NodeSe
 	req := &omnimeshv1.AgentStreamRequest{
 		Payload: &omnimeshv1.AgentStreamRequest_UpdateNodeServices{
 			UpdateNodeServices: &omnimeshv1.UpdateNodeServicesRequest{
-				AddedServices: added,
+				AddedServices:   addedProto,
+				RemovedServices: removedProto,
 			},
 		},
 	}
 
-	if err := stream.Send(req); err != nil {
+	c.sendMu.Lock()
+	err := stream.Send(req)
+	c.sendMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("failed to send UpdateNodeServices request: %w", err)
 	}
-	log.Printf("Sent UpdateNodeServices with %d services to Control Plane.\n", len(added))
+	log.Printf("Sent UpdateNodeServices (%d added, %d removed) to Control Plane.\n", len(addedProto), len(removedProto))
+	return nil
+}
+
+// SendUpdateServices sends updated service definitions to the control plane (added only).
+func (c *Client) SendUpdateServices(ctx context.Context, services []model.NodeServiceInfo) error {
+	return c.SendServiceUpdates(ctx, services, nil)
+}
+
+// SendHealthReport sends a health status report to the control plane.
+func (c *Client) SendHealthReport(ctx context.Context, report *omnimeshv1.HealthReport) error {
+	c.mu.Lock()
+	stream := c.stream
+	c.mu.Unlock()
+
+	if stream == nil {
+		return fmt.Errorf("stream is not connected")
+	}
+
+	req := &omnimeshv1.AgentStreamRequest{
+		Payload: &omnimeshv1.AgentStreamRequest_HealthReport{
+			HealthReport: report,
+		},
+	}
+
+	c.sendMu.Lock()
+	err := stream.Send(req)
+	c.sendMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to send HealthReport request: %w", err)
+	}
+	log.Printf("Sent HealthReport to Control Plane: %s/%s (%s) -> %v via %s\n",
+		report.Namespace, report.ServiceName, report.RouteName, report.Status, report.ProbeType)
 	return nil
 }
 

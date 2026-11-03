@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/esachser/omnimeshcontrol v0.0.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/spiffe/go-spiffe/v2 v2.8.1
 	golang.org/x/net v0.51.0
 	golang.org/x/sys v0.42.0
