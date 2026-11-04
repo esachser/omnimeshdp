@@ -9,11 +9,11 @@ import (
 )
 
 func getSpireDialer(rawAddr string) (string, func(context.Context, string) (net.Conn, error)) {
-	if strings.HasPrefix(rawAddr, "unix://") || strings.HasPrefix(rawAddr, "unix:") {
-		address := strings.TrimPrefix(strings.TrimPrefix(rawAddr, "unix://"), "unix:")
-		return address, func(ctx context.Context, addr string) (net.Conn, error) {
+	if strings.HasPrefix(rawAddr, "unix:/") || strings.HasPrefix(rawAddr, "unix:") {
+		address := strings.TrimPrefix(rawAddr, "unix:")
+		return rawAddr, func(ctx context.Context, addr string) (net.Conn, error) {
 			var d net.Dialer
-			return d.DialContext(ctx, "unix", addr)
+			return d.DialContext(ctx, "unix", address)
 		}
 	}
 	if strings.HasPrefix(rawAddr, "/") {
@@ -26,4 +26,3 @@ func getSpireDialer(rawAddr string) (string, func(context.Context, string) (net.
 	address := strings.TrimPrefix(rawAddr, "tcp://")
 	return address, nil
 }
-

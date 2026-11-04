@@ -1,5 +1,6 @@
 {
   "spire": {
+    "admin_socket_path": "unix:/tmp/spire-agent/private/admin.sock",
     "socket_path": "unix:/tmp/spire-agent/public/api.sock",
     "server_svid": "spiffe://omnimesh.local/ns/omnimesh-system/sa/omnimeshcontrol",
     "disabled": false

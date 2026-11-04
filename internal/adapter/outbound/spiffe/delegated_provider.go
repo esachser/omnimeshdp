@@ -205,4 +205,3 @@ func (p *DelegatedWorkloadProvider) Close() error {
 	}
 	return nil
 }
-
