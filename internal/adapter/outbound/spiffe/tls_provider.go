@@ -5,9 +5,15 @@ import (
 	"crypto/tls"
 	"time"
 
+	"github.com/esachser/omnimeshdp/internal/port/outbound"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
+)
+
+var (
+	_ outbound.TLSConfigProvider       = (*SpiffeTLSProvider)(nil)
+	_ outbound.ServerTLSConfigProvider = (*SpiffeTLSProvider)(nil)
 )
 
 type SpiffeTLSProvider struct {
@@ -30,9 +36,28 @@ func NewSpiffeTLSProvider(ctx context.Context, socketPath string, serverSVID str
 	return &SpiffeTLSProvider{source: source, serverSVID: serverID}, nil
 }
 
+// GetTLSConfig returns the mTLS client config for connecting to the control plane.
 func (s *SpiffeTLSProvider) GetTLSConfig() (*tls.Config, error) {
 	tlsConfig := tlsconfig.MTLSClientConfig(s.source, s.source, tlsconfig.AuthorizeID(s.serverSVID))
 	return tlsConfig, nil
+}
+
+// GetServerTLSConfig returns the mTLS server config for receiving inter-agent mesh traffic.
+func (s *SpiffeTLSProvider) GetServerTLSConfig() (*tls.Config, error) {
+	authorizer := tlsconfig.AuthorizeMemberOf(s.serverSVID.TrustDomain())
+	tlsConfig := tlsconfig.MTLSServerConfig(s.source, s.source, authorizer)
+	tlsConfig.NextProtos = []string{"h2"}
+	return tlsConfig, nil
+}
+
+// Source returns the underlying SPIFFE X509Source (which also implements x509bundle.Source).
+func (s *SpiffeTLSProvider) Source() *workloadapi.X509Source {
+	return s.source
+}
+
+// ServerSVID returns the configured server SPIFFE ID.
+func (s *SpiffeTLSProvider) ServerSVID() spiffeid.ID {
+	return s.serverSVID
 }
 
 func (s *SpiffeTLSProvider) Close() error {

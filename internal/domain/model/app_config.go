@@ -21,9 +21,11 @@ type AppConfig struct {
 
 // SpireConfig holds configuration for the SPIFFE/SPIRE workload API agent.
 type SpireConfig struct {
-	SocketPath string `json:"socket_path"`
-	ServerSVID string `json:"server_svid"`
-	Disabled   bool   `json:"disabled"`
+	SocketPath      string `json:"socket_path"`
+	AdminSocketPath string `json:"admin_socket_path"`
+	ServerSVID      string `json:"server_svid"`
+	TrustDomain     string `json:"trust_domain"`
+	Disabled        bool   `json:"disabled"`
 }
 
 // ListenersConfig holds port/address configuration for local interception and mesh proxying.
@@ -98,6 +100,12 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 	}
 	if sock := os.Getenv("CP_SOCKET_PATH"); sock != "" {
 		cfg.Spire.SocketPath = sock
+	}
+	if adminSock := os.Getenv("SPIRE_ADMIN_SOCKET_PATH"); adminSock != "" {
+		cfg.Spire.AdminSocketPath = adminSock
+	}
+	if td := os.Getenv("SPIRE_TRUST_DOMAIN"); td != "" {
+		cfg.Spire.TrustDomain = td
 	}
 	if spireDisabled := os.Getenv("SPIRE_DISABLED"); spireDisabled != "" {
 		cfg.Spire.Disabled = strings.ToLower(spireDisabled) == "true" || spireDisabled == "1"

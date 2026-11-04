@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -25,6 +26,7 @@ type ClientSideService struct {
 	packetProcessor outbound.PacketProcessor
 	hboneClient     *hbone.Client
 	router          *Router
+	svidProvider    outbound.WorkloadSVIDProvider
 }
 
 // NewClientSideService constructs a new ClientSideService.
@@ -64,6 +66,20 @@ func (s *ClientSideService) SetPacketProcessor(p outbound.PacketProcessor) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.packetProcessor = p
+}
+
+// SetWorkloadSVIDProvider configures the provider that fetches SVIDs by calling process PID.
+func (s *ClientSideService) SetWorkloadSVIDProvider(p outbound.WorkloadSVIDProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.svidProvider = p
+}
+
+// WorkloadSVIDProvider returns the active WorkloadSVIDProvider, or nil if none is configured.
+func (s *ClientSideService) WorkloadSVIDProvider() outbound.WorkloadSVIDProvider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.svidProvider
 }
 
 // Start begins accepting local connections and tunneling them over HBONE.
@@ -121,12 +137,14 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	}
 
 	var identity string
+	var clientTLS *tls.Config
 	targetHost := s.targetHost
 	realDest := "172.27.153.78:8000"
 
 	s.mu.RLock()
 	processor := s.packetProcessor
 	router := s.router
+	svidProv := s.svidProvider
 	s.mu.RUnlock()
 
 	if processor != nil {
@@ -136,7 +154,18 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 			return
 		}
 
-		identity, _ = processor.GetIdentityByPID(pktInfo.PID)
+		// Retrieve SVID using PID of calling process to impersonate the service via mTLS
+		if svidProv != nil && pktInfo.PID != 0 {
+			tlsCfg, spiffeID, err := svidProv.GetClientTLSConfigByPID(ctx, pktInfo.PID)
+			if err != nil {
+				log.Printf("Could not retrieve SVID for caller PID %d: %v\n", pktInfo.PID, err)
+				return
+			}
+			clientTLS = tlsCfg
+			identity = spiffeID
+		} else {
+			identity, _ = processor.GetIdentityByPID(pktInfo.PID)
+		}
 
 		if pktInfo.IP != 0 {
 			destIP := fmt.Sprintf("%d.%d.%d.%d",
@@ -155,15 +184,15 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	}
 
 	log.Printf(
-		"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s)\n",
+		"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s, mTLS=%v)\n",
 		targetHost,
 		identity,
 		peerAddr.String(),
 		realDest,
+		clientTLS != nil,
 	)
 
-	if err := s.hboneClient.Tunnel(ctx, localConn, targetHost, realDest, identity); err != nil {
+	if err := s.hboneClient.Tunnel(ctx, localConn, targetHost, realDest, identity, clientTLS); err != nil {
 		log.Printf("Tunnel error: %v\n", err)
 	}
 }
-

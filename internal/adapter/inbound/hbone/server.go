@@ -2,6 +2,7 @@ package hbone
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log"
@@ -20,12 +21,17 @@ type Server struct {
 	addr       string
 	httpServer *http.Server
 	listener   net.Listener
+	tlsConfig  *tls.Config
 }
 
 // NewServer creates a new HBONE server listening on the specified address.
-func NewServer(addr string) *Server {
+// If tlsConfig is provided, the server enforces HTTP/2 over TLS with mTLS.
+func NewServer(addr string, tlsConfig ...*tls.Config) *Server {
 	s := &Server{
 		addr: addr,
+	}
+	if len(tlsConfig) > 0 && tlsConfig[0] != nil {
+		s.tlsConfig = tlsConfig[0].Clone()
 	}
 
 	h2Server := &http2.Server{
@@ -41,6 +47,15 @@ func NewServer(addr string) *Server {
 	return s
 }
 
+// SetTLSConfig updates the server's mTLS configuration.
+func (s *Server) SetTLSConfig(tlsConfig *tls.Config) {
+	if tlsConfig != nil {
+		s.tlsConfig = tlsConfig.Clone()
+	} else {
+		s.tlsConfig = nil
+	}
+}
+
 // Start binds to the listener and serves HTTP/2 HBONE connections.
 func (s *Server) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.addr)
@@ -54,7 +69,29 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.listener = ln
 
-	log.Printf("Proxy HBONE server running on %s...\n", ln.Addr().String())
+	if s.tlsConfig != nil {
+		hasH2 := false
+		for _, p := range s.tlsConfig.NextProtos {
+			if p == "h2" {
+				hasH2 = true
+				break
+			}
+		}
+		if !hasH2 {
+			s.tlsConfig.NextProtos = append([]string{"h2"}, s.tlsConfig.NextProtos...)
+		}
+		s.httpServer.TLSConfig = s.tlsConfig
+
+		h2Server := &http2.Server{
+			IdleTimeout: 120 * time.Second,
+		}
+		if err := http2.ConfigureServer(s.httpServer, h2Server); err != nil {
+			return err
+		}
+		ln = tls.NewListener(ln, s.tlsConfig)
+	}
+
+	log.Printf("Proxy HBONE server running on %s (tls=%v)...\n", ln.Addr().String(), s.tlsConfig != nil)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -86,6 +123,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if realDest == "" {
 		http.Error(w, "Missing x-omnimesh-real-dest header", http.StatusBadRequest)
 		return
+	}
+
+	var callerIdentity string
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		peerCert := r.TLS.PeerCertificates[0]
+		if len(peerCert.URIs) > 0 {
+			callerIdentity = peerCert.URIs[0].String()
+		}
+	}
+	if callerIdentity == "" {
+		callerIdentity = r.Header.Get("x-omnimesh-caller-identity")
+		if callerIdentity == "" {
+			callerIdentity = r.Header.Get("x-omnimesh-source-identity")
+		}
+	}
+	if callerIdentity != "" {
+		log.Printf("Proxy HBONE server accepted connection for %s from caller %s\n", realDest, callerIdentity)
 	}
 
 	// Dial target real destination. The socket is marked so Linux redirect rules

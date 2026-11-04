@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
@@ -16,13 +17,19 @@ type ServerSideService struct {
 }
 
 // NewServerSideService creates a new ServerSideService listening on listenAddr.
-func NewServerSideService(listenAddr string) *ServerSideService {
+// If serverTLS is provided, the server enforces HTTP/2 over TLS with mTLS.
+func NewServerSideService(listenAddr string, serverTLS ...*tls.Config) *ServerSideService {
 	if listenAddr == "" {
 		listenAddr = "0.0.0.0:15008"
 	}
 	return &ServerSideService{
-		server: hbone.NewServer(listenAddr),
+		server: hbone.NewServer(listenAddr, serverTLS...),
 	}
+}
+
+// SetTLSConfig updates the server's mTLS configuration.
+func (s *ServerSideService) SetTLSConfig(cfg *tls.Config) {
+	s.server.SetTLSConfig(cfg)
 }
 
 // Start runs the HBONE server until context cancellation.
@@ -34,4 +41,3 @@ func (s *ServerSideService) Start(ctx context.Context) error {
 func (s *ServerSideService) Serve(ctx context.Context, ln net.Listener) error {
 	return s.server.Serve(ctx, ln)
 }
-

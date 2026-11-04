@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 )
 
 // PacketProcessorFactory creates a packet processor configured with the given subnets.
@@ -27,6 +29,9 @@ type PacketProcessorFactory func(interceptionType string, subnets []string, inte
 
 // TLSProviderFactory creates a SPIFFE TLS config provider.
 type TLSProviderFactory func(ctx context.Context, socketPath, serverSVID string) (outbound.TLSConfigProvider, io.Closer, error)
+
+// WorkloadSVIDProviderFactory creates a WorkloadSVIDProvider for fetching SVIDs by calling process PID.
+type WorkloadSVIDProviderFactory func(ctx context.Context, socketPath string, bundleSource x509bundle.Source, trustDomain string) (outbound.WorkloadSVIDProvider, io.Closer, error)
 
 // ControlPlaneClientFactory creates a ControlPlaneClient for connecting to omnimeshcontrol.
 type ControlPlaneClientFactory func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient
@@ -43,6 +48,7 @@ type Orchestrator struct {
 	config           *model.AppConfig
 	processorFactory PacketProcessorFactory
 	tlsFactory       TLSProviderFactory
+	svidFactory      WorkloadSVIDProviderFactory
 	cpClientFactory  ControlPlaneClientFactory
 	listenerOpener   ListenerOpener
 	retryInterval    time.Duration
@@ -52,6 +58,8 @@ type Orchestrator struct {
 	internalPort       uint16
 	tlsProvider        outbound.TLSConfigProvider
 	tlsCloser          io.Closer
+	svidProvider       outbound.WorkloadSVIDProvider
+	svidCloser         io.Closer
 	internalListener   net.Listener
 	externalListener   net.Listener
 	clientSideService  *proxy.ClientSideService
@@ -100,6 +108,20 @@ func WithTLSFactory(fn TLSProviderFactory) Option {
 	}
 }
 
+// WithWorkloadSVIDProviderFactory configures custom WorkloadSVIDProvider creation.
+func WithWorkloadSVIDProviderFactory(fn WorkloadSVIDProviderFactory) Option {
+	return func(o *Orchestrator) {
+		o.svidFactory = fn
+	}
+}
+
+// WithWorkloadSVIDProvider configures a pre-instantiated WorkloadSVIDProvider.
+func WithWorkloadSVIDProvider(provider outbound.WorkloadSVIDProvider) Option {
+	return func(o *Orchestrator) {
+		o.svidProvider = provider
+	}
+}
+
 // WithControlPlaneClientFactory configures custom ControlPlaneClient creation.
 func WithControlPlaneClientFactory(fn ControlPlaneClientFactory) Option {
 	return func(o *Orchestrator) {
@@ -126,6 +148,13 @@ func NewOrchestrator(opts ...Option) *Orchestrator {
 	o := &Orchestrator{
 		tlsFactory: func(ctx context.Context, socketPath, serverSVID string) (outbound.TLSConfigProvider, io.Closer, error) {
 			provider, err := spiffe.NewSpiffeTLSProvider(ctx, socketPath, serverSVID)
+			if err != nil {
+				return nil, nil, err
+			}
+			return provider, provider, nil
+		},
+		svidFactory: func(ctx context.Context, socketPath string, bundleSource x509bundle.Source, trustDomain string) (outbound.WorkloadSVIDProvider, io.Closer, error) {
+			provider, err := spiffe.NewDelegatedWorkloadProvider(ctx, socketPath, bundleSource, trustDomain)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -181,6 +210,30 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}
 		o.tlsProvider = provider
 		o.tlsCloser = closer
+
+		// Initialize Delegated Workload SVID Provider for impersonating calling services
+		if o.svidProvider == nil && o.svidFactory != nil {
+			adminSocket := o.config.Spire.AdminSocketPath
+			if adminSocket == "" {
+				adminSocket = o.config.Spire.SocketPath
+			}
+			trustDomain := o.config.Spire.TrustDomain
+			var bundleSource x509bundle.Source
+			if sp, ok := provider.(*spiffe.SpiffeTLSProvider); ok {
+				bundleSource = sp.Source()
+				if trustDomain == "" {
+					trustDomain = sp.ServerSVID().TrustDomain().String()
+				}
+			}
+			svidProv, svidCloser, err := o.svidFactory(ctx, adminSocket, bundleSource, trustDomain)
+			if err != nil {
+				log.Printf("[Step 2/10] Warning: failed to connect to SPIRE Delegated Identity API: %v\n", err)
+			} else {
+				o.svidProvider = svidProv
+				o.svidCloser = svidCloser
+				log.Println("[Step 2/10] Successfully initialized Delegated Workload SVID Provider.")
+			}
+		}
 		log.Println("[Step 2/10] Successfully obtained mTLS configuration from Spire Agent.")
 	}
 
@@ -207,7 +260,19 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	o.router = proxy.NewRouter()
 	o.clientSideService = proxy.NewClientSideService(o.config.Listeners.InternalAddr, "", nil)
 	o.clientSideService.SetRouter(o.router)
-	o.serverSideService = proxy.NewServerSideService(o.config.Listeners.ExternalAddr)
+	if o.svidProvider != nil {
+		o.clientSideService.SetWorkloadSVIDProvider(o.svidProvider)
+	}
+
+	var serverTLS *tls.Config
+	if o.tlsProvider != nil {
+		if sp, ok := o.tlsProvider.(outbound.ServerTLSConfigProvider); ok {
+			if cfg, err := sp.GetServerTLSConfig(); err == nil {
+				serverTLS = cfg
+			}
+		}
+	}
+	o.serverSideService = proxy.NewServerSideService(o.config.Listeners.ExternalAddr, serverTLS)
 
 	o.wg.Add(1)
 	go func() {
@@ -397,6 +462,9 @@ func (o *Orchestrator) Cleanup() {
 	if o.tlsCloser != nil {
 		_ = o.tlsCloser.Close()
 	}
+	if o.svidCloser != nil {
+		_ = o.svidCloser.Close()
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -416,6 +484,13 @@ func (o *Orchestrator) ServiceManager() *service.Manager {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.serviceManager
+}
+
+// WorkloadSVIDProvider returns the active WorkloadSVIDProvider used by the Orchestrator, or nil if none is running.
+func (o *Orchestrator) WorkloadSVIDProvider() outbound.WorkloadSVIDProvider {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.svidProvider
 }
 
 // Router returns the mesh Router used by the Orchestrator.

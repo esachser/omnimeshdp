@@ -20,6 +20,7 @@ import (
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 )
 
 // Mock PacketProcessor
@@ -198,6 +199,10 @@ type mockTLSProvider struct{}
 
 func (m *mockTLSProvider) GetTLSConfig() (*tls.Config, error) {
 	return &tls.Config{}, nil
+}
+
+func (m *mockTLSProvider) GetServerTLSConfig() (*tls.Config, error) {
+	return nil, nil
 }
 
 // Mock net.Listener
@@ -1046,4 +1051,74 @@ func TestOrchestratorDynamicServicesAndHealth(t *testing.T) {
 	}
 }
 
+type mockWorkloadSVIDProvider struct{}
+
+func (m *mockWorkloadSVIDProvider) GetClientTLSConfigByPID(ctx context.Context, pid uint64) (*tls.Config, string, error) {
+	return &tls.Config{}, "spiffe://omnimesh.local/ns/default/sa/test-service", nil
+}
+
+type testCloser struct {
+	onClose func()
+}
+
+func (c *testCloser) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return nil
+}
+
+func TestOrchestrator_WorkloadSVIDProviderWiring(t *testing.T) {
+	cfg := validTestConfig()
+	mockProc := &mockPacketProcessor{}
+	mockCP := &mockControlPlaneClient{}
+
+	svidFactoryCalled := false
+	svidCloserClosed := false
+
+	orch := orchestrator.NewOrchestrator(
+		orchestrator.WithConfig(cfg),
+		orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+			return mockProc, nil
+		}),
+		orchestrator.WithTLSFactory(func(ctx context.Context, socketPath, serverSVID string) (outbound.TLSConfigProvider, io.Closer, error) {
+			return &mockTLSProvider{}, io.NopCloser(nil), nil
+		}),
+		orchestrator.WithWorkloadSVIDProviderFactory(func(ctx context.Context, socketPath string, bundleSource x509bundle.Source, trustDomain string) (outbound.WorkloadSVIDProvider, io.Closer, error) {
+			svidFactoryCalled = true
+			return &mockWorkloadSVIDProvider{}, &testCloser{onClose: func() { svidCloserClosed = true }}, nil
+		}),
+		orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+			return mockCP
+		}),
+		orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+			return newMockListener(address), nil
+		}),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- orch.Run(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if !svidFactoryCalled {
+		t.Errorf("expected WorkloadSVIDProviderFactory to be called in Step 2")
+	}
+
+	if orch.WorkloadSVIDProvider() == nil {
+		t.Errorf("expected active WorkloadSVIDProvider on orchestrator")
+	}
+
+	cancel()
+	if err := <-errCh; err != nil {
+		t.Fatalf("unexpected error on shutdown: %v", err)
+	}
+
+	if !svidCloserClosed {
+		t.Errorf("expected SVID closer to be called during Cleanup")
+	}
+}
 
