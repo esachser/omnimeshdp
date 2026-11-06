@@ -524,7 +524,7 @@ func TestOrchestrator_ControlPlaneReconnectOnStreamFailure(t *testing.T) {
 				Namespace:   "default",
 				ServiceName: "reconnected-svc",
 				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
-					{Addr: "192.168.1.100:15008", TargetAddress: "127.0.0.1:8080"},
+					{Addr: "192.168.1.100:15008"},
 				},
 			},
 		},

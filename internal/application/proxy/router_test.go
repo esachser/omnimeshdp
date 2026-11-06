@@ -27,9 +27,8 @@ func TestRouter_ApplySnapshotAndResolve(t *testing.T) {
 				ServiceName: "product-service",
 				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
 					{
-						NodeId:   "node-2",
-						Addr:     "192.168.1.102:15008",
-						TargetAddress: "10.10.10.50:8080",
+						NodeId: "node-2",
+						Addr:   "192.168.1.102:15008",
 					},
 				},
 			},
@@ -38,7 +37,7 @@ func TestRouter_ApplySnapshotAndResolve(t *testing.T) {
 
 	router.ApplySnapshot(snapshot)
 
-	// Resolve existing route with exact port
+	// Resolve existing route by destination IP
 	route := router.ResolveRoute("10.10.10.50", 8080, "fallback:15008")
 	if route == nil {
 		t.Fatalf("expected resolved route, got nil")
@@ -79,9 +78,8 @@ func TestRouter_ApplyUpdate(t *testing.T) {
 				ServiceName: "cart-service",
 				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
 					{
-						NodeId:   "node-1",
-						Addr:     "192.168.1.101:15008",
-						TargetAddress: "10.10.10.60:8080",
+						NodeId: "node-1",
+						Addr:   "192.168.1.101:15008",
 					},
 				},
 			},
@@ -94,7 +92,7 @@ func TestRouter_ApplyUpdate(t *testing.T) {
 		t.Fatalf("expected node-1 target, got %s", route.TargetHost)
 	}
 
-	// 2. Modify route with ScopeUpdate
+	// 2. Modify existing node route with ScopeUpdate
 	router.ApplyUpdate(&omnimeshv1.ScopeUpdate{
 		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_MODIFY,
 		Routes: []*omnimeshv1.RouteInfo{
@@ -103,9 +101,8 @@ func TestRouter_ApplyUpdate(t *testing.T) {
 				ServiceName: "cart-service",
 				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
 					{
-						NodeId:   "node-3",
-						Addr:     "192.168.1.103:15008",
-						TargetAddress: "10.10.10.60:9090",
+						NodeId: "node-1",
+						Addr:   "192.168.1.103:15008",
 					},
 				},
 			},
@@ -116,8 +113,8 @@ func TestRouter_ApplyUpdate(t *testing.T) {
 	if updatedRoute.TargetHost != "192.168.1.103:15008" {
 		t.Errorf("expected updated TargetHost, got %s", updatedRoute.TargetHost)
 	}
-	if updatedRoute.RealDest != "10.10.10.60:9090" {
-		t.Errorf("expected updated RealDest, got %s", updatedRoute.RealDest)
+	if updatedRoute.RealDest != "10.10.10.60:8080" {
+		t.Errorf("expected RealDest '10.10.10.60:8080', got %s", updatedRoute.RealDest)
 	}
 
 	// 3. Remove route
@@ -142,6 +139,115 @@ func TestRouter_ApplyUpdate(t *testing.T) {
 	removedRoute := router.ResolveRoute("10.10.10.60", 8080, "fallback:15008")
 	if removedRoute.TargetHost != "fallback:15008" {
 		t.Errorf("expected fallback TargetHost after removal, got %s", removedRoute.TargetHost)
+	}
+}
+
+func TestRouter_RoundRobinAndTargetAddressRouting(t *testing.T) {
+	// Node processing the connection is "node-local" in target "target-a" (gateway "gw-a.internal:8443")
+	router := proxy.NewRouterWithNode("node-local", "target-a")
+
+	router.ApplySnapshot(&omnimeshv1.ScopeSnapshot{
+		Services: []*omnimeshv1.ServiceInfo{
+			{
+				Namespace: "production",
+				Name:      "payment-service",
+				MeshAddr:  "10.10.20.10",
+				Port:      8080,
+			},
+			{
+				Namespace: "production",
+				Name:      "order-service",
+				MeshAddr:  "10.10.20.11",
+				Port:      9090,
+			},
+		},
+		Routes: []*omnimeshv1.RouteInfo{
+			// Local node's own route (establishes local node's TargetAddress = "gw-a.internal:8443")
+			{
+				Namespace:   "production",
+				ServiceName: "order-service",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{
+						NodeId:        "node-local",
+						Addr:          "192.168.1.10:15008",
+						RouteName:     "order-local-1",
+						Target:        "target-a",
+						TargetAddress: "gw-a.internal:8443",
+					},
+				},
+			},
+			// First target node for payment-service: in the SAME target ("target-a", same TargetAddress)
+			{
+				Namespace:   "production",
+				ServiceName: "payment-service",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{
+						NodeId:        "node-peer-same-target",
+						Addr:          "192.168.1.20:15008",
+						RouteName:     "payment-1",
+						Target:        "target-a",
+						TargetAddress: "gw-a.internal:8443",
+					},
+				},
+			},
+			// Second target node for payment-service: in a DIFFERENT target ("target-b", different TargetAddress)
+			{
+				Namespace:   "production",
+				ServiceName: "payment-service",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{
+						NodeId:        "node-remote-target",
+						Addr:          "10.244.1.50:15008",
+						RouteName:     "payment-2",
+						Target:        "target-b",
+						TargetAddress: "gw-b.external:8443",
+					},
+				},
+			},
+		},
+	})
+
+	// 1st connection: selects node-peer-same-target (same TargetAddress -> uses direct Addr)
+	r1 := router.ResolveRoute("10.10.20.10", 8080, "fallback:15008")
+	if r1.TargetHost != "192.168.1.20:15008" {
+		t.Errorf("expected 1st route to use direct node Addr '192.168.1.20:15008', got %q", r1.TargetHost)
+	}
+	if r1.RealDest != "10.10.20.10:8080" {
+		t.Errorf("expected RealDest '10.10.20.10:8080', got %q", r1.RealDest)
+	}
+
+	// 2nd connection: selects node-remote-target (different TargetAddress -> uses TargetAddress as targetHost)
+	r2 := router.ResolveRoute("10.10.20.10", 8080, "fallback:15008")
+	if r2.TargetHost != "gw-b.external:8443" {
+		t.Errorf("expected 2nd route to use remote TargetAddress 'gw-b.external:8443', got %q", r2.TargetHost)
+	}
+
+	// 3rd connection: wraps around round-robin back to 1st target node
+	r3 := router.ResolveRoute("10.10.20.10", 8080, "fallback:15008")
+	if r3.TargetHost != "192.168.1.20:15008" {
+		t.Errorf("expected 3rd route to wrap around to '192.168.1.20:15008', got %q", r3.TargetHost)
+	}
+
+	// Remove only the remote target node via ScopeUpdate; peer node in target-a must remain
+	router.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		Routes: []*omnimeshv1.RouteInfo{
+			{
+				Namespace:   "production",
+				ServiceName: "payment-service",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{
+						NodeId:    "node-remote-target",
+						RouteName: "payment-2",
+					},
+				},
+			},
+		},
+	})
+
+	r4 := router.ResolveRoute("10.10.20.10", 8080, "fallback:15008")
+	if r4.TargetHost != "192.168.1.20:15008" {
+		t.Errorf("expected remaining route '192.168.1.20:15008', got %q", r4.TargetHost)
 	}
 }
 

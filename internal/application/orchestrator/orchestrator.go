@@ -257,7 +257,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		intLn.Addr().String(), extLn.Addr().String())
 
 	// Hand off listeners to proxy services
-	o.router = proxy.NewRouter()
+	o.router = proxy.NewRouterWithNode(o.config.ControlPlane.NodeID, o.config.ControlPlane.Target)
 	o.clientSideService = proxy.NewClientSideService(o.config.Listeners.InternalAddr, "", nil)
 	o.clientSideService.SetRouter(o.router)
 	if o.svidProvider != nil {

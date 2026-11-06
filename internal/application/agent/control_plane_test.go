@@ -3,6 +3,7 @@ package agent_test
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -455,4 +456,81 @@ func TestControlPlaneAgent_StreamingSnapshotInvokesHandler(t *testing.T) {
 
 	cancel()
 	<-streamDone
+}
+
+func TestResolveRegistrationAddr(t *testing.T) {
+	// Explicit IP addresses and hostnames must be preserved as-is
+	explicitCases := []string{
+		"10.0.0.1:15008",
+		"192.168.1.50:15008",
+		"127.0.0.1:15008",
+		"my-node.local:15008",
+	}
+	for _, tc := range explicitCases {
+		got := agent.ResolveRegistrationAddr(tc)
+		if got != tc {
+			t.Errorf("ResolveRegistrationAddr(%q) = %q, want %q", tc, got, tc)
+		}
+	}
+
+	// Unspecified addresses must resolve to a valid, non-unspecified IP preserving the port
+	unspecifiedCases := []struct {
+		input    string
+		wantPort string
+	}{
+		{input: "0.0.0.0:15008", wantPort: "15008"},
+		{input: "[::]:15008", wantPort: "15008"},
+		{input: ":15008", wantPort: "15008"},
+		{input: "0.0.0.0:9443", wantPort: "9443"},
+	}
+	for _, tc := range unspecifiedCases {
+		got := agent.ResolveRegistrationAddr(tc.input)
+		host, port, err := net.SplitHostPort(got)
+		if err != nil {
+			t.Fatalf("ResolveRegistrationAddr(%q) returned invalid host:port %q: %v", tc.input, got, err)
+		}
+		if port != tc.wantPort {
+			t.Errorf("ResolveRegistrationAddr(%q) port = %q, want %q", tc.input, port, tc.wantPort)
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			t.Errorf("ResolveRegistrationAddr(%q) host %q is not a valid IP", tc.input, host)
+		} else if ip.IsUnspecified() {
+			t.Errorf("ResolveRegistrationAddr(%q) resolved to unspecified IP %q", tc.input, host)
+		}
+	}
+}
+
+func TestControlPlaneAgent_RegisterResolvesUnspecifiedAddr(t *testing.T) {
+	mock := &mockCPClient{}
+	cpAgent := agent.NewControlPlaneAgentWithConfig(mock, "node-test", "target-test")
+
+	ctx := context.Background()
+	if err := cpAgent.Connect(ctx); err != nil {
+		t.Fatalf("unexpected connect error: %v", err)
+	}
+
+	if _, err := cpAgent.RegisterAndGetSnapshot(ctx, "0.0.0.0:15008", nil); err != nil {
+		t.Fatalf("unexpected register error: %v", err)
+	}
+
+	mock.mu.Lock()
+	reg := mock.lastRegisteredNode
+	mock.mu.Unlock()
+
+	if reg == nil {
+		t.Fatalf("expected node registration to be recorded")
+	}
+
+	host, port, err := net.SplitHostPort(reg.Addr)
+	if err != nil {
+		t.Fatalf("expected valid host:port in registration Addr, got %q: %v", reg.Addr, err)
+	}
+	if port != "15008" {
+		t.Errorf("expected port 15008, got %q", port)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsUnspecified() {
+		t.Errorf("expected reachable non-unspecified IP in registration Addr, got %q", reg.Addr)
+	}
 }

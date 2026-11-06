@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"log"
+	"net"
 	"os"
 	"runtime"
 	"sync"
@@ -143,6 +144,11 @@ func (a *ControlPlaneAgent) RegisterAndGetSnapshot(
 		externalAddr = "127.0.0.1:15008"
 	}
 
+	resolvedAddr := ResolveRegistrationAddr(externalAddr)
+	if resolvedAddr != externalAddr {
+		log.Printf("[ControlPlaneAgent] Resolved unspecified external address %q to %q for registration\n", externalAddr, resolvedAddr)
+	}
+
 	a.mu.Lock()
 	a.lastExternalAddr = externalAddr
 	if len(services) > 0 {
@@ -157,13 +163,79 @@ func (a *ControlPlaneAgent) RegisterAndGetSnapshot(
 	reg := &model.NodeRegistration{
 		NodeID:   a.nodeID,
 		Platform: platform,
-		Addr:     externalAddr,
+		Addr:     resolvedAddr,
 		Labels:   labelsCopy,
 		Services: services,
 		Target:   a.target,
 	}
 
 	return a.client.RegisterAndGetSnapshot(ctx, reg)
+}
+
+// ResolveRegistrationAddr ensures that an unspecified listen address (such as 0.0.0.0:15008,
+// [::]:15008, or :15008) is resolved to the node's reachable local outbound IP address while
+// preserving explicit IP addresses or hostnames unchanged.
+func ResolveRegistrationAddr(externalAddr string) string {
+	if externalAddr == "" {
+		return net.JoinHostPort(resolveOutboundIP(), "15008")
+	}
+
+	host, port, err := net.SplitHostPort(externalAddr)
+	if err != nil {
+		if ip := net.ParseIP(externalAddr); ip != nil && ip.IsUnspecified() {
+			return net.JoinHostPort(resolveOutboundIP(), "15008")
+		}
+		return externalAddr
+	}
+
+	if host == "" {
+		return net.JoinHostPort(resolveOutboundIP(), port)
+	}
+
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return net.JoinHostPort(resolveOutboundIP(), port)
+	}
+
+	return externalAddr
+}
+
+func resolveOutboundIP() string {
+	// Query OS routing table for preferred outbound IPv4 address (no packets are sent).
+	if conn, err := net.Dial("udp4", "8.8.8.8:80"); err == nil {
+		defer conn.Close()
+		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP != nil {
+			if ip4 := udpAddr.IP.To4(); ip4 != nil && !ip4.IsUnspecified() && !ip4.IsLoopback() {
+				return ip4.String()
+			}
+		}
+	}
+
+	// Fallback: inspect active non-loopback network interfaces.
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() && !ip4.IsLinkLocalUnicast() && !ip4.IsUnspecified() {
+					return ip4.String()
+				}
+			}
+		}
+	}
+
+	return "127.0.0.1"
 }
 
 // SendDeployedServices sends service updates to the Control Plane (Step 9).
