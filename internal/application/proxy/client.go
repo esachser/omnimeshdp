@@ -138,6 +138,7 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 
 	var identity string
 	var clientTLS *tls.Config
+	var nodeServiceID string
 	targetHost := s.targetHost
 	realDest := "172.27.153.78:8000"
 
@@ -178,21 +179,23 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 				if resolved != nil {
 					targetHost = resolved.TargetHost
 					realDest = resolved.RealDest
+					nodeServiceID = resolved.ServiceID
 				}
 			}
 		}
 	}
 
 	log.Printf(
-		"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s, mTLS=%v)\n",
+		"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s, nodeServiceID: %q, mTLS=%v)\n",
 		targetHost,
 		identity,
 		peerAddr.String(),
 		realDest,
+		nodeServiceID,
 		clientTLS != nil,
 	)
 
-	if err := s.hboneClient.Tunnel(ctx, localConn, targetHost, realDest, identity, clientTLS); err != nil {
+	if err := s.hboneClient.TunnelToService(ctx, localConn, targetHost, realDest, nodeServiceID, identity, clientTLS); err != nil {
 		log.Printf("Tunnel error: %v\n", err)
 	}
 }

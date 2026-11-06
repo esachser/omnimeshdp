@@ -150,6 +150,9 @@ func (h *HealthChecker) runProber(ctx context.Context, p *serviceProber) {
 	unhealthyThresh := cfg.GetUnhealthyThreshold()
 	probeType := cfg.GetProbeType()
 	targetAddr := cfg.GetTargetAddress()
+	if strings.TrimSpace(cfg.Address) == "" && cfg.Port == 0 && p.svc.Address() != "" {
+		targetAddr = p.svc.Address()
+	}
 
 	executeProbe := func() {
 		probeCtx, cancel := context.WithTimeout(ctx, timeout)

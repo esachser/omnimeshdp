@@ -25,6 +25,8 @@
       "namespace": "default",
       "name": "sample-service",
       "id": "svc-test-1",
+      "host": "127.0.0.1",
+      "port": 8080,
       "labels": {
         "app": "sample"
       }

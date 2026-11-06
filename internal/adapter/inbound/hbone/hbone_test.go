@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
+	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
@@ -300,6 +301,101 @@ func TestHBONETunnelEcho_MTLS(t *testing.T) {
 		t.Fatalf("failed to read echoed data from mTLS tunnel: %v", err)
 	}
 
+	if string(buf[:n]) != string(testPayload) {
+		t.Fatalf("echo mismatch: got %q, expected %q", string(buf[:n]), string(testPayload))
+	}
+}
+
+func TestHBONETunnel_ResolvesServiceByID(t *testing.T) {
+	// 1. Start a local backend TCP echo server on a real random port
+	echoListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start echo listener: %v", err)
+	}
+	defer echoListener.Close()
+
+	tcpAddr := echoListener.Addr().(*net.TCPAddr)
+
+	go func() {
+		for {
+			conn, err := echoListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	// 2. Start HBONE server configured with the local service's host and port
+	hbListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve port for HBONE server: %v", err)
+	}
+	hbAddr := hbListener.Addr().String()
+	_ = hbListener.Close()
+
+	server := hbone.NewServer(hbAddr)
+	server.SetServices([]model.NodeServiceInfo{
+		{
+			Namespace: "production",
+			Name:      "payment-service",
+			ID:        "sample-1",
+			Host:      "127.0.0.1",
+			Port:      tcpAddr.Port,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		_ = server.Start(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Create HBONE client and tunnel using virtual mesh IP as realDest + "sample-1" as serviceID
+	client := hbone.NewClient()
+	clientSide, proxySide := net.Pipe()
+	defer clientSide.Close()
+	defer proxySide.Close()
+
+	go func() {
+		_ = client.TunnelToService(
+			ctx,
+			proxySide,
+			hbAddr,
+			"10.240.0.99:80", // unroutable virtual mesh IP
+			"sample-1",       // service ID resolved by destination HBONE server
+			"test-identity",
+		)
+	}()
+
+	testPayload := []byte("Routed to local service via x-omnimesh-service-id!")
+	writeErrCh := make(chan error, 1)
+	go func() {
+		_, err := clientSide.Write(testPayload)
+		writeErrCh <- err
+	}()
+
+	select {
+	case err := <-writeErrCh:
+		if err != nil {
+			t.Fatalf("failed to write to tunnel: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout writing to tunnel")
+	}
+
+	buf := make([]byte, len(testPayload))
+	_ = clientSide.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err := io.ReadFull(clientSide, buf)
+	if err != nil {
+		t.Fatalf("failed to read echoed data from tunnel: %v", err)
+	}
 	if string(buf[:n]) != string(testPayload) {
 		t.Fatalf("echo mismatch: got %q, expected %q", string(buf[:n]), string(testPayload))
 	}

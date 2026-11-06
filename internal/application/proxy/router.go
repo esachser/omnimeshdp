@@ -518,7 +518,10 @@ func (r *Router) ResolveRoute(destIP string, destPort uint16, defaultTargetHost 
 	}
 
 	return &model.ResolvedRoute{
-		TargetHost: targetHost,
-		RealDest:   fallbackRealDest,
+		TargetHost:  targetHost,
+		RealDest:    fallbackRealDest,
+		ServiceID:   targetNode.RouteName,
+		Namespace:   svc.Namespace,
+		ServiceName: svc.Name,
 	}
 }

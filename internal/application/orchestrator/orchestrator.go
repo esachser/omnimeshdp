@@ -371,6 +371,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}
 	}
 	log.Printf("[Step 8/10] Loaded %d services to deploy from config/files/directory.\n", len(o.servicesToDeploy))
+	if o.serverSideService != nil {
+		o.serverSideService.SetServices(o.servicesToDeploy)
+	}
 
 	// Step 9: Send and receive updates to/from Control Plane and update routing config and packet filtering.
 	// - This should run until the application is stopped.
@@ -386,6 +389,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		ServicesDir:       o.config.ServicesDir,
 		InitialServices:   o.servicesToDeploy,
 		ControlPlaneAgent: o.controlPlaneAgent,
+		OnServicesChange: func(added, removed []model.NodeServiceInfo) {
+			if o.serverSideService != nil {
+				o.serverSideService.UpdateServices(added, removed)
+			}
+		},
 	})
 	o.mu.Lock()
 	o.serviceManager = svcMgr

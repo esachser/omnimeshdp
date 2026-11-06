@@ -249,6 +249,12 @@ func TestRouter_RoundRobinAndTargetAddressRouting(t *testing.T) {
 	if r4.TargetHost != "192.168.1.20:15008" {
 		t.Errorf("expected remaining route '192.168.1.20:15008', got %q", r4.TargetHost)
 	}
+	if r4.ServiceID != "payment-1" {
+		t.Errorf("expected ServiceID 'payment-1', got %q", r4.ServiceID)
+	}
+	if r4.Namespace != "production" || r4.ServiceName != "payment-service" {
+		t.Errorf("expected Namespace='production' ServiceName='payment-service', got %q/%q", r4.Namespace, r4.ServiceName)
+	}
 }
 
 func TestRouter_ConcurrentAccess(t *testing.T) {

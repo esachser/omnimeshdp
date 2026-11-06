@@ -17,6 +17,8 @@ func TestServicesIO(t *testing.T) {
 		"namespace": "production",
 		"name": "auth-service",
 		"id": "auth-1",
+		"host": "127.0.0.1",
+		"port": 8080,
 		"labels": {"tier": "auth"},
 		"health_check": {
 			"type": "HTTP",
@@ -37,7 +39,7 @@ func TestServicesIO(t *testing.T) {
 	if len(singleSvcs) != 1 {
 		t.Fatalf("expected 1 service, got %d", len(singleSvcs))
 	}
-	if singleSvcs[0].Name != "auth-service" || singleSvcs[0].HealthCheck == nil || singleSvcs[0].HealthCheck.GetProbeType() != "HTTP" {
+	if singleSvcs[0].Name != "auth-service" || singleSvcs[0].Host != "127.0.0.1" || singleSvcs[0].Port != 8080 || singleSvcs[0].Address() != "127.0.0.1:8080" || singleSvcs[0].HealthCheck == nil || singleSvcs[0].HealthCheck.GetProbeType() != "HTTP" {
 		t.Fatalf("unexpected parsed service: %+v", singleSvcs[0])
 	}
 

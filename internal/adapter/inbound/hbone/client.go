@@ -15,6 +15,17 @@ import (
 	"golang.org/x/net/http2"
 )
 
+const (
+	// HeaderRealDest carries the intercepted destination IP:port.
+	HeaderRealDest = "x-omnimesh-real-dest"
+	// HeaderNodeServiceID carries the target service instance ID (NodeServiceInfo.ID / RouteName).
+	HeaderNodeServiceID = "x-omnimesh-node-service-id"
+	// HeaderCallerIdentity carries the caller SPIFFE identity.
+	HeaderCallerIdentity = "x-omnimesh-caller-identity"
+	// HeaderSourceIdentity carries the source SPIFFE identity.
+	HeaderSourceIdentity = "x-omnimesh-source-identity"
+)
+
 // Client establishes and manages HTTP/2 HBONE tunnels to mesh endpoints.
 type Client struct {
 	httpClient *http.Client
@@ -84,6 +95,21 @@ func (c *Client) Tunnel(
 	identity string,
 	tlsConfig ...*tls.Config,
 ) error {
+	return c.TunnelToService(ctx, localConn, targetHost, realDest, "", identity, tlsConfig...)
+}
+
+// TunnelToService creates an HBONE CONNECT tunnel to targetHost, carrying both the intercepted realDest
+// and the target serviceID (via x-omnimesh-service-id) so the destination agent can connect to the
+// locally configured service host and port.
+func (c *Client) TunnelToService(
+	ctx context.Context,
+	localConn net.Conn,
+	targetHost string,
+	realDest string,
+	nodeServiceID string,
+	identity string,
+	tlsConfig ...*tls.Config,
+) error {
 	pr, pw := io.Pipe()
 
 	var cfg *tls.Config
@@ -100,10 +126,13 @@ func (c *Client) Tunnel(
 	}
 
 	req.Header.Set("Host", targetHost)
-	req.Header.Set("x-omnimesh-real-dest", realDest)
+	req.Header.Set(HeaderRealDest, realDest)
+	if nodeServiceID != "" {
+		req.Header.Set(HeaderNodeServiceID, nodeServiceID)
+	}
 	if identity != "" {
-		req.Header.Set("x-omnimesh-caller-identity", identity)
-		req.Header.Set("x-omnimesh-source-identity", identity)
+		req.Header.Set(HeaderCallerIdentity, identity)
+		req.Header.Set(HeaderSourceIdentity, identity)
 	}
 
 	resp, err := httpClient.Do(req)
@@ -118,7 +147,7 @@ func (c *Client) Tunnel(
 		return fmt.Errorf("%w: status %d", domain.ErrTunnelFailed, resp.StatusCode)
 	}
 
-	log.Printf("HBONE tunnel established to %s (destination %s, identity %q)\n", targetHost, realDest, identity)
+	log.Printf("HBONE tunnel established to %s (destination %s, nodeServiceID %q, identity %q)\n", targetHost, realDest, nodeServiceID, identity)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
