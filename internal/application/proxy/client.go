@@ -6,12 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
+	"github.com/esachser/omnimeshdp/internal/domain"
+	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/inbound"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
 )
@@ -27,6 +32,7 @@ type ClientSideService struct {
 	hboneClient     *hbone.Client
 	router          *Router
 	svidProvider    outbound.WorkloadSVIDProvider
+	defaultRetry    model.RetryConfig
 }
 
 // NewClientSideService constructs a new ClientSideService.
@@ -39,18 +45,17 @@ func NewClientSideService(
 		listenAddr = "127.0.0.1:15001"
 	}
 	if targetHost == "" {
-		if envTarget := os.Getenv("TARGET_HBONE_HOST"); envTarget != "" {
-			targetHost = envTarget
-		} else {
-			targetHost = "192.168.15.57:15008"
-		}
+		targetHost = os.Getenv("TARGET_HBONE_HOST")
 	}
+
+	defaultRetry, _ := model.DefaultRoutingConfig().ToRetryConfig()
 
 	return &ClientSideService{
 		listenAddr:      listenAddr,
 		targetHost:      targetHost,
 		packetProcessor: processor,
 		hboneClient:     hbone.NewClient(),
+		defaultRetry:    defaultRetry,
 	}
 }
 
@@ -59,6 +64,18 @@ func (s *ClientSideService) SetRouter(r *Router) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.router = r
+}
+
+// SetRoutingConfig updates the fallback data-plane routing/retry defaults.
+func (s *ClientSideService) SetRoutingConfig(cfg model.RoutingConfig) error {
+	parsed, err := cfg.ToRetryConfig()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultRetry = parsed
+	return nil
 }
 
 // SetPacketProcessor updates the packet processor.
@@ -136,66 +153,252 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 		}
 	}
 
-	var identity string
-	var clientTLS *tls.Config
-	var nodeServiceID string
-	targetHost := s.targetHost
-	realDest := "172.27.153.78:8000"
-
 	s.mu.RLock()
 	processor := s.packetProcessor
 	router := s.router
 	svidProv := s.svidProvider
+	fallbackHost := s.targetHost
+	defaultRetry := s.defaultRetry
 	s.mu.RUnlock()
 
-	if processor != nil {
-		pktInfo, err := processor.GetOriginalPacketInfo(peerAddr, socketHandle)
-		if err != nil || pktInfo == nil {
-			log.Printf("Could not retrieve original packet info for peer %s: %v\n", peerAddr, err)
+	var identity string
+	var clientTLS *tls.Config
+
+	if processor == nil {
+		if fallbackHost == "" {
+			log.Printf("No packet processor or target host configured for caller %s; closing connection\n", peerAddr)
 			return
 		}
-
-		// Retrieve SVID using PID of calling process to impersonate the service via mTLS
-		if svidProv != nil && pktInfo.PID != 0 {
-			tlsCfg, spiffeID, err := svidProv.GetClientTLSConfigByPID(ctx, pktInfo.PID)
-			if err != nil {
-				log.Printf("Could not retrieve SVID for caller PID %d: %v\n", pktInfo.PID, err)
-				return
-			}
-			clientTLS = tlsCfg
-			identity = spiffeID
-		} else {
-			identity, _ = processor.GetIdentityByPID(pktInfo.PID)
-		}
-
-		if pktInfo.IP != 0 {
-			destIP := fmt.Sprintf("%d.%d.%d.%d",
-				byte(pktInfo.IP>>24), byte(pktInfo.IP>>16), byte(pktInfo.IP>>8), byte(pktInfo.IP),
-			)
-			realDest = fmt.Sprintf("%s:%d", destIP, pktInfo.Port)
-
-			if router != nil {
-				resolved := router.ResolveRoute(destIP, pktInfo.Port, s.targetHost)
-				if resolved != nil {
-					targetHost = resolved.TargetHost
-					realDest = resolved.RealDest
-					nodeServiceID = resolved.ServiceID
-				}
-			}
-		}
+		s.singleTunnel(ctx, localConn, fallbackHost, "172.27.153.78:8000", "", identity, clientTLS, defaultRetry.ConnectTimeout)
+		return
 	}
 
+	pktInfo, err := processor.GetOriginalPacketInfo(peerAddr, socketHandle)
+	if err != nil || pktInfo == nil {
+		log.Printf("Could not retrieve original packet info for peer %s: %v\n", peerAddr, err)
+		return
+	}
+
+	// Retrieve SVID using PID of calling process to impersonate the service via mTLS
+	if svidProv != nil && pktInfo.PID != 0 {
+		tlsCfg, spiffeID, err := svidProv.GetClientTLSConfigByPID(ctx, pktInfo.PID)
+		if err != nil {
+			log.Printf("Could not retrieve SVID for caller PID %d: %v\n", pktInfo.PID, err)
+			return
+		}
+		clientTLS = tlsCfg
+		identity = spiffeID
+	} else {
+		identity, _ = processor.GetIdentityByPID(pktInfo.PID)
+	}
+
+	if pktInfo.IP == 0 || router == nil {
+		if fallbackHost == "" {
+			log.Printf("No router or fallback host configured for caller %s; closing connection\n", peerAddr)
+			return
+		}
+		realDest := "172.27.153.78:8000"
+		if pktInfo.IP != 0 {
+			realDest = formatIPv4Port(pktInfo.IP, pktInfo.Port)
+		}
+		s.singleTunnel(ctx, localConn, fallbackHost, realDest, "", identity, clientTLS, defaultRetry.ConnectTimeout)
+		return
+	}
+
+	_ = s.tunnelWithRetries(ctx, localConn, router, pktInfo.IP, pktInfo.Port, fallbackHost, identity, clientTLS, defaultRetry)
+}
+
+func (s *ClientSideService) singleTunnel(
+	ctx context.Context,
+	localConn net.Conn,
+	targetHost string,
+	realDest string,
+	nodeServiceID string,
+	identity string,
+	clientTLS *tls.Config,
+	connectTimeout time.Duration,
+) {
+	if connectTimeout <= 0 {
+		connectTimeout = model.DefaultConnectTimeout
+	}
 	log.Printf(
 		"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s, nodeServiceID: %q, mTLS=%v)\n",
 		targetHost,
 		identity,
-		peerAddr.String(),
+		localConn.RemoteAddr().String(),
 		realDest,
 		nodeServiceID,
 		clientTLS != nil,
 	)
 
-	if err := s.hboneClient.TunnelToService(ctx, localConn, targetHost, realDest, nodeServiceID, identity, clientTLS); err != nil {
+	tunnel, err := s.hboneClient.OpenTunnelWithTimeout(ctx, connectTimeout, targetHost, realDest, nodeServiceID, identity, clientTLS)
+	if err != nil {
 		log.Printf("Tunnel error: %v\n", err)
+		return
+	}
+	if err := tunnel.Bridge(localConn); err != nil {
+		log.Printf("Tunnel bridge error: %v\n", err)
+	}
+}
+
+func (s *ClientSideService) tunnelWithRetries(
+	ctx context.Context,
+	localConn net.Conn,
+	router *Router,
+	destIP uint32,
+	destPort uint16,
+	fallbackHost string,
+	identity string,
+	clientTLS *tls.Config,
+	defaultRetry model.RetryConfig,
+) error {
+	var excludedBuf [8]model.EndpointKey
+	excluded := excludedBuf[:0]
+	var lastErr error
+	attempt := 0
+
+	for {
+		resolved, retryCfg, err := router.ResolveRouteIPv4(destIP, destPort, fallbackHost, excluded)
+		if err != nil {
+			if attempt == 0 {
+				log.Printf("No route available for %s (caller port %s): %v\n",
+					formatIPv4Port(destIP, destPort), localConn.RemoteAddr().String(), err)
+				return err
+			}
+			wrapped := fmt.Errorf("%w after %d attempt(s) (tried=%v): %w",
+				domain.ErrRetriesExhausted, attempt, excluded, lastErr)
+			log.Printf("Routing retries exhausted for %s: %v\n",
+				formatIPv4Port(destIP, destPort), wrapped)
+			return wrapped
+		}
+
+		connectTimeout := retryCfg.ConnectTimeout
+		if connectTimeout <= 0 {
+			connectTimeout = defaultRetry.ConnectTimeout
+			if connectTimeout <= 0 {
+				connectTimeout = model.DefaultConnectTimeout
+			}
+		}
+
+		release := router.AcquireEndpoint(resolved.EndpointKey)
+
+		log.Printf(
+			"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s, nodeServiceID: %q, attempt=%d, mTLS=%v)\n",
+			resolved.TargetHost,
+			identity,
+			localConn.RemoteAddr().String(),
+			resolved.RealDest,
+			resolved.ServiceID,
+			attempt+1,
+			clientTLS != nil,
+		)
+
+		tunnel, err := s.hboneClient.OpenTunnelWithTimeout(
+			ctx,
+			connectTimeout,
+			resolved.TargetHost,
+			resolved.RealDest,
+			resolved.ServiceID,
+			identity,
+			clientTLS,
+		)
+		if err == nil {
+			defer release()
+			if bridgeErr := tunnel.Bridge(localConn); bridgeErr != nil {
+				log.Printf("Tunnel bridge error: %v\n", bridgeErr)
+				return bridgeErr
+			}
+			return nil
+		}
+
+		release()
+		lastErr = err
+
+		if !isRetryableRouteError(ctx, err, retryCfg) {
+			log.Printf("Non-retryable HBONE tunnel error to %s (destination %s, nodeServiceID %q): %v\n",
+				resolved.TargetHost, resolved.RealDest, resolved.ServiceID, err)
+			return err
+		}
+
+		// Peer 502 (and configured connect failures) indicates a wrong/stale routing choice
+		// for this connection. Never mark the endpoint unhealthy; exclude only for this
+		// connection and retry another candidate.
+		log.Printf("HBONE routing attempt %d failed for %s/%s endpoint %+v (%s): %v; selecting another endpoint\n",
+			attempt+1, resolved.Namespace, resolved.ServiceName, resolved.EndpointKey, resolved.TargetHost, err)
+		excluded = append(excluded, resolved.EndpointKey)
+
+		if attempt >= retryCfg.MaxRetries {
+			wrapped := fmt.Errorf("%w for %s/%s after %d attempt(s) (tried=%v): %w",
+				domain.ErrRetriesExhausted, resolved.Namespace, resolved.ServiceName, attempt+1, excluded, err)
+			log.Printf("Routing retries exhausted: %v\n", wrapped)
+			return wrapped
+		}
+
+		attempt++
+		if retryCfg.BackoffBase > 0 && router.HasAvailableEndpointIPv4(destIP, excluded) {
+			delay := computeRetryBackoff(retryCfg.BackoffBase, retryCfg.BackoffMax, attempt)
+			if !sleepWithContext(ctx, delay) {
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+func isRetryableRouteError(ctx context.Context, err error, cfg model.RetryConfig) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	var statusErr *domain.TunnelStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode == http.StatusBadGateway {
+			return true
+		}
+		if cfg.RetryOn5xx && statusErr.StatusCode >= 500 && statusErr.StatusCode <= 599 {
+			return true
+		}
+		return false
+	}
+	if cfg.RetryOnConnectFail && errors.Is(err, domain.ErrTunnelFailed) {
+		return true
+	}
+	return false
+}
+
+func computeRetryBackoff(base, maxDur time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if maxDur < base {
+		maxDur = base
+	}
+	delay := base
+	for i := 1; i < attempt; i++ {
+		if delay >= maxDur {
+			delay = maxDur
+			break
+		}
+		if delay > maxDur/2 {
+			delay = maxDur
+			break
+		}
+		delay *= 2
+	}
+	if delay <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(delay) + 1))
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
