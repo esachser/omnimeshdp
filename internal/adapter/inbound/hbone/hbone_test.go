@@ -7,20 +7,25 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"net/url"
 	"testing"
 	"time"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
+	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 func TestHBONETunnelEcho(t *testing.T) {
@@ -398,5 +403,142 @@ func TestHBONETunnel_ResolvesServiceByID(t *testing.T) {
 	}
 	if string(buf[:n]) != string(testPayload) {
 		t.Fatalf("echo mismatch: got %q, expected %q", string(buf[:n]), string(testPayload))
+	}
+}
+
+func TestHBONEOpenTunnel_StatusErrorsAndTimeoutLifetime(t *testing.T) {
+	// 1. Real HBONE server pointing to a closed local port returns 502 Bad Gateway
+	closedLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve closed port: %v", err)
+	}
+	closedAddr := closedLn.Addr().String()
+	_ = closedLn.Close()
+
+	hbLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	hbAddr := hbLn.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := hbone.NewServer(hbAddr)
+	go func() {
+		_ = server.Serve(ctx, hbLn)
+	}()
+
+	client := hbone.NewClient()
+
+	_, err = client.OpenTunnelWithTimeout(ctx, 2*time.Second, hbAddr, closedAddr, "", "test-id")
+	if err == nil {
+		t.Fatal("expected 502 error, got nil")
+	}
+	if !errors.Is(err, domain.ErrBadGateway) {
+		t.Fatalf("expected errors.Is(err, ErrBadGateway), got: %v", err)
+	}
+	if !errors.Is(err, domain.ErrTunnelFailed) {
+		t.Fatalf("expected errors.Is(err, ErrTunnelFailed), got: %v", err)
+	}
+	var statusErr *domain.TunnelStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected TunnelStatusError{502}, got: %v", err)
+	}
+
+	// 2. Non-502 status (403 Forbidden) does not match ErrBadGateway
+	forbiddenLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer forbiddenLn.Close()
+	h2Srv := &http2.Server{}
+	forbiddenHTTP := &http.Server{
+		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		}), h2Srv),
+	}
+	go func() { _ = forbiddenHTTP.Serve(forbiddenLn) }()
+	defer forbiddenHTTP.Close()
+
+	_, err = client.OpenTunnelWithTimeout(ctx, 2*time.Second, forbiddenLn.Addr().String(), closedAddr, "", "test-id")
+	if err == nil {
+		t.Fatal("expected 403 error, got nil")
+	}
+	if errors.Is(err, domain.ErrBadGateway) {
+		t.Fatalf("403 Forbidden must not match ErrBadGateway: %v", err)
+	}
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected TunnelStatusError{403}, got: %v", err)
+	}
+
+	// 3. Handshake timeout does NOT kill a tunnel that succeeds before connectTimeout
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start echo: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	tunnel, err := client.OpenTunnelWithTimeout(ctx, 80*time.Millisecond, hbAddr, echoLn.Addr().String(), "", "test-id")
+	if err != nil {
+		t.Fatalf("expected tunnel to open before 80ms connectTimeout, got: %v", err)
+	}
+	// Wait longer than connectTimeout before bridging to ensure the stream was NOT canceled!
+	time.Sleep(150 * time.Millisecond)
+
+	clientSide, proxySide := net.Pipe()
+	defer clientSide.Close()
+	defer proxySide.Close()
+
+	go func() { _ = tunnel.Bridge(proxySide) }()
+
+	msg := []byte("still alive past connectTimeout!")
+	if _, err := clientSide.Write(msg); err != nil {
+		t.Fatalf("write failed past connectTimeout: %v", err)
+	}
+	buf := make([]byte, len(msg))
+	_ = clientSide.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(clientSide, buf); err != nil {
+		t.Fatalf("read failed past connectTimeout: %v", err)
+	}
+	if string(buf) != string(msg) {
+		t.Fatalf("echo mismatch: got %q, want %q", string(buf), string(msg))
+	}
+
+	// 4. Slow/stalled peer times out cleanly within connectTimeout with context.DeadlineExceeded
+	stalledLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen for stalled server: %v", err)
+	}
+	defer stalledLn.Close()
+	stalledRelease := make(chan struct{})
+	defer close(stalledRelease)
+	stalledHTTP := &http.Server{
+		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-stalledRelease
+		}), &http2.Server{}),
+	}
+	go func() { _ = stalledHTTP.Serve(stalledLn) }()
+	defer stalledHTTP.Close()
+
+	start := time.Now()
+	_, err = client.OpenTunnelWithTimeout(ctx, 60*time.Millisecond, stalledLn.Addr().String(), closedAddr, "", "test-id")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded on stalled peer, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected timeout around 60ms, took %v", elapsed)
 	}
 }

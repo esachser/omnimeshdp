@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -14,6 +15,7 @@ type AppConfig struct {
 	Listeners    ListenersConfig    `json:"listeners"`
 	ControlPlane ControlPlaneConfig `json:"control_plane"`
 	Interception InterceptionConfig `json:"interception"`
+	Routing      RoutingConfig      `json:"routing"`
 	Services     []NodeServiceInfo  `json:"services"`
 	ServicesFile string             `json:"services_file"`
 	ServicesDir  string             `json:"services_dir"`
@@ -69,6 +71,7 @@ func DefaultConfig() *AppConfig {
 		Interception: InterceptionConfig{
 			Type: "wfp",
 		},
+		Routing:     DefaultRoutingConfig(),
 		Services:    make([]NodeServiceInfo, 0),
 		ServicesDir: "./services.d/",
 	}
@@ -137,6 +140,25 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 	if svcDir := os.Getenv("SERVICES_DIR"); svcDir != "" {
 		cfg.ServicesDir = svcDir
 	}
+	if maxRetriesStr, ok := os.LookupEnv("ROUTING_DEFAULT_MAX_RETRIES"); ok && maxRetriesStr != "" {
+		maxRetries, err := strconv.Atoi(strings.TrimSpace(maxRetriesStr))
+		if err != nil {
+			return nil, fmt.Errorf("invalid ROUTING_DEFAULT_MAX_RETRIES %q: %w", maxRetriesStr, err)
+		}
+		cfg.Routing.DefaultMaxRetries = maxRetries
+	}
+	if backoffBase := os.Getenv("ROUTING_DEFAULT_BACKOFF_BASE"); backoffBase != "" {
+		cfg.Routing.DefaultBackoffBase = backoffBase
+	}
+	if backoffMax := os.Getenv("ROUTING_DEFAULT_BACKOFF_MAX"); backoffMax != "" {
+		cfg.Routing.DefaultBackoffMax = backoffMax
+	}
+	if connectTimeout := os.Getenv("ROUTING_CONNECT_TIMEOUT"); connectTimeout != "" {
+		cfg.Routing.ConnectTimeout = connectTimeout
+	}
+	if retryOnConnFail, ok := os.LookupEnv("ROUTING_RETRY_ON_CONNECT_FAILURE"); ok && retryOnConnFail != "" {
+		cfg.Routing.RetryOnConnectFailure = strings.EqualFold(retryOnConnFail, "true") || retryOnConnFail == "1"
+	}
 
 	// 3. Read services file if specified
 	if cfg.ServicesFile != "" {
@@ -171,6 +193,9 @@ func (c *AppConfig) Validate() error {
 	}
 	if _, _, err := net.SplitHostPort(c.Listeners.ExternalAddr); err != nil {
 		return fmt.Errorf("invalid external listen address %q: %w", c.Listeners.ExternalAddr, err)
+	}
+	if err := c.Routing.Validate(); err != nil {
+		return fmt.Errorf("invalid routing configuration: %w", err)
 	}
 	return nil
 }

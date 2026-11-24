@@ -258,8 +258,14 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	// Hand off listeners to proxy services
 	o.router = proxy.NewRouterWithNode(o.config.ControlPlane.NodeID, o.config.ControlPlane.Target)
+	if err := o.router.SetRoutingConfig(o.config.Routing); err != nil {
+		log.Printf("[Step 3/10] Warning: invalid routing configuration, using defaults: %v\n", err)
+	}
 	o.clientSideService = proxy.NewClientSideService(o.config.Listeners.InternalAddr, "", nil)
 	o.clientSideService.SetRouter(o.router)
+	if err := o.clientSideService.SetRoutingConfig(o.config.Routing); err != nil {
+		log.Printf("[Step 3/10] Warning: invalid client routing configuration, using defaults: %v\n", err)
+	}
 	if o.svidProvider != nil {
 		o.clientSideService.SetWorkloadSVIDProvider(o.svidProvider)
 	}

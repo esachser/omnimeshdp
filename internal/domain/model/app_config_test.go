@@ -19,6 +19,18 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Interception.Type != "wfp" {
 		t.Fatalf("expected default interception type 'wfp', got %q", cfg.Interception.Type)
 	}
+	if cfg.Routing.DefaultMaxRetries != model.DefaultMaxRetries {
+		t.Fatalf("expected default max retries %d, got %d", model.DefaultMaxRetries, cfg.Routing.DefaultMaxRetries)
+	}
+	if cfg.Routing.DefaultBackoffBase != "0ms" {
+		t.Fatalf("expected default backoff base '0ms', got %q", cfg.Routing.DefaultBackoffBase)
+	}
+	if cfg.Routing.DefaultBackoffMax != "500ms" {
+		t.Fatalf("expected default backoff max '500ms', got %q", cfg.Routing.DefaultBackoffMax)
+	}
+	if cfg.Routing.ConnectTimeout != "5s" {
+		t.Fatalf("expected default connect timeout '5s', got %q", cfg.Routing.ConnectTimeout)
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("default config should be valid: %v", err)
 	}
@@ -111,6 +123,84 @@ func TestConfigValidation(t *testing.T) {
 	cfg.Listeners.ExternalAddr = "not-a-port"
 	if err := cfg.Validate(); err == nil {
 		t.Errorf("expected validation error for invalid external_addr")
+	}
+
+	// Invalid routing max retries
+	cfg = model.DefaultConfig()
+	cfg.Routing.DefaultMaxRetries = -1
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected validation error for negative default_max_retries")
+	}
+
+	// Invalid routing backoff base
+	cfg = model.DefaultConfig()
+	cfg.Routing.DefaultBackoffBase = "-5ms"
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected validation error for negative default_backoff_base")
+	}
+
+	// Backoff max < backoff base
+	cfg = model.DefaultConfig()
+	cfg.Routing.DefaultBackoffBase = "200ms"
+	cfg.Routing.DefaultBackoffMax = "100ms"
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected validation error when default_backoff_max < default_backoff_base")
+	}
+
+	// Connect timeout <= 0
+	cfg = model.DefaultConfig()
+	cfg.Routing.ConnectTimeout = "0s"
+	if err := cfg.Validate(); err == nil {
+		t.Errorf("expected validation error for zero connect_timeout")
+	}
+}
+
+func TestRoutingConfigFileAndEnvOverrides(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.json")
+	configJSON := `{
+		"spire": {"disabled": true},
+		"routing": {
+			"default_max_retries": 5,
+			"default_backoff_base": "25ms",
+			"default_backoff_max": "250ms",
+			"connect_timeout": "2s",
+			"retry_on_connect_failure": true
+		}
+	}`
+	if err := os.WriteFile(configFile, []byte(configJSON), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	cfg, err := model.LoadConfig(configFile)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	if cfg.Routing.DefaultMaxRetries != 5 || cfg.Routing.DefaultBackoffBase != "25ms" ||
+		cfg.Routing.DefaultBackoffMax != "250ms" || cfg.Routing.ConnectTimeout != "2s" ||
+		!cfg.Routing.RetryOnConnectFailure {
+		t.Fatalf("unexpected routing config from file: %+v", cfg.Routing)
+	}
+
+	t.Setenv("ROUTING_DEFAULT_MAX_RETRIES", "2")
+	t.Setenv("ROUTING_DEFAULT_BACKOFF_BASE", "10ms")
+	t.Setenv("ROUTING_DEFAULT_BACKOFF_MAX", "100ms")
+	t.Setenv("ROUTING_CONNECT_TIMEOUT", "3s")
+	t.Setenv("ROUTING_RETRY_ON_CONNECT_FAILURE", "false")
+
+	cfgEnv, err := model.LoadConfig(configFile)
+	if err != nil {
+		t.Fatalf("failed to load config with routing env overrides: %v", err)
+	}
+	if cfgEnv.Routing.DefaultMaxRetries != 2 || cfgEnv.Routing.DefaultBackoffBase != "10ms" ||
+		cfgEnv.Routing.DefaultBackoffMax != "100ms" || cfgEnv.Routing.ConnectTimeout != "3s" ||
+		cfgEnv.Routing.RetryOnConnectFailure {
+		t.Fatalf("unexpected routing config after env overrides: %+v", cfgEnv.Routing)
+	}
+
+	t.Setenv("ROUTING_DEFAULT_MAX_RETRIES", "not-an-int")
+	if _, err := model.LoadConfig(configFile); err == nil {
+		t.Fatalf("expected error for invalid ROUTING_DEFAULT_MAX_RETRIES")
 	}
 }
 
