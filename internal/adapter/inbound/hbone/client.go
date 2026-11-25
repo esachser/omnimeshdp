@@ -67,15 +67,15 @@ type tunnelConn struct {
 	remoteAddr net.Addr
 }
 
-func (c *tunnelConn) Read(p []byte) (int, error)         { return c.reader.Read(p) }
-func (c *tunnelConn) Write(p []byte) (int, error)        { return c.tunnel.pw.Write(p) }
-func (c *tunnelConn) Close() error                       { _ = c.reader.Close(); return c.tunnel.Close() }
-func (c *tunnelConn) CloseWrite() error                  { return c.tunnel.pw.Close() }
-func (c *tunnelConn) LocalAddr() net.Addr                { return c.localAddr }
-func (c *tunnelConn) RemoteAddr() net.Addr               { return c.remoteAddr }
-func (c *tunnelConn) SetDeadline(t time.Time) error      { return c.reader.SetReadDeadline(t) }
-func (c *tunnelConn) SetReadDeadline(t time.Time) error  { return c.reader.SetReadDeadline(t) }
-func (c *tunnelConn) SetWriteDeadline(time.Time) error   { return nil }
+func (c *tunnelConn) Read(p []byte) (int, error)        { return c.reader.Read(p) }
+func (c *tunnelConn) Write(p []byte) (int, error)       { return c.tunnel.pw.Write(p) }
+func (c *tunnelConn) Close() error                      { _ = c.reader.Close(); return c.tunnel.Close() }
+func (c *tunnelConn) CloseWrite() error                 { return c.tunnel.pw.Close() }
+func (c *tunnelConn) LocalAddr() net.Addr               { return c.localAddr }
+func (c *tunnelConn) RemoteAddr() net.Addr              { return c.remoteAddr }
+func (c *tunnelConn) SetDeadline(t time.Time) error     { return c.reader.SetReadDeadline(t) }
+func (c *tunnelConn) SetReadDeadline(t time.Time) error { return c.reader.SetReadDeadline(t) }
+func (c *tunnelConn) SetWriteDeadline(time.Time) error  { return nil }
 
 type hboneAddr struct {
 	addr string
@@ -173,12 +173,17 @@ func (c *Client) getClient(targetHost string, tlsConfig *tls.Config) (*http.Clie
 		return client, "https://" + targetHost
 	}
 
-	t := &http2.Transport{
+	protos := new(http.Protocols)
+	protos.SetHTTP2(true)
+
+	t := &http.Transport{
+		Protocols:       protos,
 		TLSClientConfig: tlsConfig,
-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := net.Dialer{Control: sockmark.Control(sockmark.ProxyMark)}
-			return (&tls.Dialer{NetDialer: &d, Config: cfg}).DialContext(ctx, network, addr)
+			return (&tls.Dialer{NetDialer: &d, Config: tlsConfig}).DialContext(ctx, network, addr)
 		},
+		ForceAttemptHTTP2: true,
 	}
 
 	client = &http.Client{Transport: t}

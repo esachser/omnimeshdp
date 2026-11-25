@@ -2,11 +2,11 @@ package httpproxy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 
 	"github.com/esachser/omnimeshdp/internal/domain/model"
-	"golang.org/x/net/http2"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -16,32 +16,42 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (b *Bridge) proxyHTTP2(ctx context.Context, downstream net.Conn, upstream net.Conn, meta model.ConnectionMeta) error {
-	h2Transport := &http2.Transport{
-		AllowHTTP:                  true,
-		DisableCompression:         true,
-		StrictMaxConcurrentStreams: true,
+	protos := new(http.Protocols)
+	protos.SetUnencryptedHTTP2(true)
+	h2Transport := &http.Transport{
+		Protocols: protos,
+		HTTP2: &http.HTTP2Config{
+			StrictMaxConcurrentRequests: true,
+		},
+		ForceAttemptHTTP2:  true,
+		DisableCompression: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return upstream, nil
+		},
 	}
 
-	clientConn, err := h2Transport.NewClientConn(upstream)
-	if err != nil {
-		return err
+	ln := newSingleConnListener(ctx, downstream)
+	defer ln.Close()
+
+	srv := &http.Server{
+		Handler:        b.newReverseProxyHandler(h2Transport, meta),
+		MaxHeaderBytes: b.cfg.MaxHeaderBytes,
+		IdleTimeout:    b.idleTimeout,
+		Protocols:      protos,
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
 	}
-	defer clientConn.Close()
 
 	stop := context.AfterFunc(ctx, func() {
-		_ = downstream.Close()
-		_ = upstream.Close()
+		_ = srv.Close()
+		_ = ln.Close()
 	})
 	defer stop()
 
-	h2Server := &http2.Server{
-		MaxReadFrameSize: 1 << 20,
-		IdleTimeout:      b.idleTimeout,
+	err := srv.Serve(ln)
+	if err != nil && (errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed)) {
+		return nil
 	}
-
-	h2Server.ServeConn(downstream, &http2.ServeConnOpts{
-		Context: ctx,
-		Handler: b.newReverseProxyHandler(roundTripperFunc(clientConn.RoundTrip), meta),
-	})
-	return nil
+	return err
 }
