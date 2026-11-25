@@ -26,15 +26,63 @@ const (
 	HeaderCallerIdentity = "x-omnimesh-caller-identity"
 	// HeaderSourceIdentity carries the source SPIFFE identity.
 	HeaderSourceIdentity = "x-omnimesh-source-identity"
+	// HeaderSourceNode carries the calling node ID across the HBONE CONNECT handshake.
+	HeaderSourceNode = "x-omnimesh-source-node"
 )
+
+// TunnelOptions configures an HBONE CONNECT tunnel attempt.
+type TunnelOptions struct {
+	ConnectTimeout time.Duration
+	TargetHost     string
+	RealDest       string
+	NodeServiceID  string
+	SourceNodeID   string
+	Identity       string
+	TLSConfig      *tls.Config
+}
 
 // Tunnel represents an established HTTP/2 HBONE CONNECT tunnel (after HTTP 200 OK).
 type Tunnel struct {
-	pw     *io.PipeWriter
-	body   io.ReadCloser
-	cancel context.CancelFunc
-	closed atomic.Bool
+	pw         *io.PipeWriter
+	body       io.ReadCloser
+	cancel     context.CancelFunc
+	targetHost string
+	closed     atomic.Bool
 }
+
+// Conn returns a net.Conn view over the established HBONE tunnel stream.
+func (t *Tunnel) Conn() net.Conn {
+	return &tunnelConn{
+		tunnel:     t,
+		reader:     newDeadlineReader(t.body),
+		remoteAddr: hboneAddr{addr: t.targetHost},
+		localAddr:  hboneAddr{addr: "local"},
+	}
+}
+
+type tunnelConn struct {
+	tunnel     *Tunnel
+	reader     *deadlineReader
+	localAddr  net.Addr
+	remoteAddr net.Addr
+}
+
+func (c *tunnelConn) Read(p []byte) (int, error)         { return c.reader.Read(p) }
+func (c *tunnelConn) Write(p []byte) (int, error)        { return c.tunnel.pw.Write(p) }
+func (c *tunnelConn) Close() error                       { _ = c.reader.Close(); return c.tunnel.Close() }
+func (c *tunnelConn) CloseWrite() error                  { return c.tunnel.pw.Close() }
+func (c *tunnelConn) LocalAddr() net.Addr                { return c.localAddr }
+func (c *tunnelConn) RemoteAddr() net.Addr               { return c.remoteAddr }
+func (c *tunnelConn) SetDeadline(t time.Time) error      { return c.reader.SetReadDeadline(t) }
+func (c *tunnelConn) SetReadDeadline(t time.Time) error  { return c.reader.SetReadDeadline(t) }
+func (c *tunnelConn) SetWriteDeadline(time.Time) error   { return nil }
+
+type hboneAddr struct {
+	addr string
+}
+
+func (a hboneAddr) Network() string { return "hbone" }
+func (a hboneAddr) String() string  { return a.addr }
 
 // Bridge streams data bidirectionally between localConn and the established HBONE tunnel
 // until both directions complete, then releases tunnel resources.
@@ -164,14 +212,25 @@ func (c *Client) OpenTunnelWithTimeout(
 	identity string,
 	tlsConfig ...*tls.Config,
 ) (*Tunnel, error) {
-	pr, pw := io.Pipe()
-
 	var cfg *tls.Config
 	if len(tlsConfig) > 0 && tlsConfig[0] != nil {
 		cfg = tlsConfig[0]
 	}
+	return c.OpenTunnelWithOptions(ctx, TunnelOptions{
+		ConnectTimeout: connectTimeout,
+		TargetHost:     targetHost,
+		RealDest:       realDest,
+		NodeServiceID:  nodeServiceID,
+		Identity:       identity,
+		TLSConfig:      cfg,
+	})
+}
 
-	httpClient, reqURL := c.getClient(targetHost, cfg)
+// OpenTunnelWithOptions performs the HTTP/2 HBONE CONNECT handshake configured by opts.
+func (c *Client) OpenTunnelWithOptions(ctx context.Context, opts TunnelOptions) (*Tunnel, error) {
+	pr, pw := io.Pipe()
+
+	httpClient, reqURL := c.getClient(opts.TargetHost, opts.TLSConfig)
 
 	reqCtx, cancelReq := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodConnect, reqURL, pr)
@@ -181,22 +240,25 @@ func (c *Client) OpenTunnelWithTimeout(
 		return nil, fmt.Errorf("failed to create CONNECT request: %w", err)
 	}
 
-	req.Header.Set("Host", targetHost)
-	req.Header.Set(HeaderRealDest, realDest)
-	if nodeServiceID != "" {
-		req.Header.Set(HeaderNodeServiceID, nodeServiceID)
+	req.Header.Set("Host", opts.TargetHost)
+	req.Header.Set(HeaderRealDest, opts.RealDest)
+	if opts.NodeServiceID != "" {
+		req.Header.Set(HeaderNodeServiceID, opts.NodeServiceID)
 	}
-	if identity != "" {
-		req.Header.Set(HeaderCallerIdentity, identity)
-		req.Header.Set(HeaderSourceIdentity, identity)
+	if opts.SourceNodeID != "" {
+		req.Header.Set(HeaderSourceNode, opts.SourceNodeID)
+	}
+	if opts.Identity != "" {
+		req.Header.Set(HeaderCallerIdentity, opts.Identity)
+		req.Header.Set(HeaderSourceIdentity, opts.Identity)
 	}
 
 	var handshakeMu sync.Mutex
 	handshakeDone := false
 	var timedOut atomic.Bool
 	var timer *time.Timer
-	if connectTimeout > 0 {
-		timer = time.AfterFunc(connectTimeout, func() {
+	if opts.ConnectTimeout > 0 {
+		timer = time.AfterFunc(opts.ConnectTimeout, func() {
 			handshakeMu.Lock()
 			done := handshakeDone
 			if !done {
@@ -242,12 +304,13 @@ func (c *Client) OpenTunnelWithTimeout(
 		return nil, &domain.TunnelStatusError{StatusCode: resp.StatusCode}
 	}
 
-	log.Printf("HBONE tunnel established to %s (destination %s, nodeServiceID %q, identity %q)\n", targetHost, realDest, nodeServiceID, identity)
+	log.Printf("HBONE tunnel established to %s (destination %s, nodeServiceID %q, identity %q)\n", opts.TargetHost, opts.RealDest, opts.NodeServiceID, opts.Identity)
 
 	return &Tunnel{
-		pw:     pw,
-		body:   resp.Body,
-		cancel: cancelReq,
+		pw:         pw,
+		body:       resp.Body,
+		cancel:     cancelReq,
+		targetHost: opts.TargetHost,
 	}, nil
 }
 

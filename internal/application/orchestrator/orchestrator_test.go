@@ -1122,3 +1122,37 @@ func TestOrchestrator_WorkloadSVIDProviderWiring(t *testing.T) {
 	}
 }
 
+type noopTestHTTPInterceptor struct{}
+
+func (n *noopTestHTTPInterceptor) Name() string { return "noop-test" }
+func (n *noopTestHTTPInterceptor) OnRequest(context.Context, *model.ConnectionMeta, *model.HTTPRequestContext) error {
+	return nil
+}
+func (n *noopTestHTTPInterceptor) OnResponse(context.Context, *model.ConnectionMeta, *model.HTTPRequestContext, *model.HTTPResponseContext) error {
+	return nil
+}
+
+func TestOrchestrator_HTTPBridgeOptionAndValidation(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Spire.Disabled = true
+	cfg.HTTP.Rules = []model.HeaderRule{
+		{Name: "bad", Phase: "request", Action: "set", Header: "Host", Value: "evil"},
+	}
+
+	orch := orchestrator.NewOrchestrator(
+		orchestrator.WithConfig(cfg),
+		orchestrator.WithHTTPInterceptors(&noopTestHTTPInterceptor{}),
+		orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+			return &mockControlPlaneClient{}
+		}),
+		orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+			return newMockListener(address), nil
+		}),
+	)
+
+	err := orch.Run(context.Background())
+	if !errors.Is(err, domain.ErrConfigLoadFailed) || !errors.Is(err, domain.ErrInvalidHeader) {
+		t.Fatalf("expected invalid HTTP rule error wrapped in ErrConfigLoadFailed, got: %v", err)
+	}
+}
+

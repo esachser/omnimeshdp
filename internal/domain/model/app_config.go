@@ -16,6 +16,7 @@ type AppConfig struct {
 	ControlPlane ControlPlaneConfig `json:"control_plane"`
 	Interception InterceptionConfig `json:"interception"`
 	Routing      RoutingConfig      `json:"routing"`
+	HTTP         HTTPConfig         `json:"http"`
 	Services     []NodeServiceInfo  `json:"services"`
 	ServicesFile string             `json:"services_file"`
 	ServicesDir  string             `json:"services_dir"`
@@ -72,6 +73,7 @@ func DefaultConfig() *AppConfig {
 			Type: "wfp",
 		},
 		Routing:     DefaultRoutingConfig(),
+		HTTP:        DefaultHTTPConfig(),
 		Services:    make([]NodeServiceInfo, 0),
 		ServicesDir: "./services.d/",
 	}
@@ -157,7 +159,10 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 		cfg.Routing.ConnectTimeout = connectTimeout
 	}
 	if retryOnConnFail, ok := os.LookupEnv("ROUTING_RETRY_ON_CONNECT_FAILURE"); ok && retryOnConnFail != "" {
-		cfg.Routing.RetryOnConnectFailure = strings.EqualFold(retryOnConnFail, "true") || retryOnConnFail == "1"
+		cfg.Routing.RetryOnConnectFailure = parseBoolValue(retryOnConnFail)
+	}
+	if err := applyHTTPEnvOverrides(&cfg.HTTP); err != nil {
+		return nil, err
 	}
 
 	// 3. Read services file if specified
@@ -197,5 +202,62 @@ func (c *AppConfig) Validate() error {
 	if err := c.Routing.Validate(); err != nil {
 		return fmt.Errorf("invalid routing configuration: %w", err)
 	}
+	if err := c.HTTP.Validate(); err != nil {
+		return fmt.Errorf("invalid HTTP configuration: %w", err)
+	}
+	return nil
+}
+
+func parseBoolValue(v string) bool {
+	trimmed := strings.TrimSpace(v)
+	return strings.EqualFold(trimmed, "true") || trimmed == "1"
+}
+
+func applyEnvBool(key string, target *bool) {
+	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
+		*target = parseBoolValue(val)
+	}
+}
+
+func applyEnvString(key string, target *string) {
+	if val := os.Getenv(key); val != "" {
+		*target = val
+	}
+}
+
+func applyEnvInt(key string, target *int) error {
+	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(val))
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", key, val, err)
+		}
+		*target = n
+	}
+	return nil
+}
+
+func applyHTTPEnvOverrides(httpCfg *HTTPConfig) error {
+	applyEnvBool("HTTP_L7_ENABLED", &httpCfg.Enabled)
+	applyEnvBool("HTTP_OUTBOUND_ENABLED", &httpCfg.Outbound.Enabled)
+	applyEnvBool("HTTP_INBOUND_ENABLED", &httpCfg.Inbound.Enabled)
+	applyEnvString("HTTP_SNIFF_TIMEOUT", &httpCfg.SniffTimeout)
+	if err := applyEnvInt("HTTP_MAX_SNIFF_BYTES", &httpCfg.MaxSniffBytes); err != nil {
+		return err
+	}
+	if err := applyEnvInt("HTTP_MAX_HEADER_BYTES", &httpCfg.MaxHeaderBytes); err != nil {
+		return err
+	}
+	applyEnvString("HTTP_IDLE_TIMEOUT", &httpCfg.IdleTimeout)
+	applyEnvBool("HTTP_FAIL_OPEN", &httpCfg.FailOpen)
+
+	applyEnvBool("HTTP_TRACING_ENABLED", &httpCfg.Tracing.Enabled)
+	applyEnvBool("HTTP_TRACING_GENERATE_TRACEPARENT", &httpCfg.Tracing.GenerateTraceparent)
+	applyEnvString("HTTP_TRACING_MODE", &httpCfg.Tracing.TraceparentMode)
+	applyEnvBool("HTTP_TRACING_DEFAULT_SAMPLED", &httpCfg.Tracing.DefaultSampled)
+	applyEnvBool("HTTP_TRACING_GENERATE_REQUEST_ID", &httpCfg.Tracing.GenerateRequestID)
+	applyEnvString("HTTP_TRACING_REQUEST_ID_HEADER", &httpCfg.Tracing.RequestIDHeader)
+	applyEnvBool("HTTP_TRACING_ECHO_RESPONSE", &httpCfg.Tracing.EchoResponseHeaders)
+
+	applyEnvBool("HTTP_MESH_HEADERS_ENABLED", &httpCfg.MeshHeaders.Enabled)
 	return nil
 }

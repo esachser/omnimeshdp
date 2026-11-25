@@ -420,6 +420,7 @@ type compiledServicePlan struct {
 	namespace        string
 	serviceName      string
 	meshAddr         string
+	protocol         string
 	defaultPort      int32
 	defaultRealDest  string
 	algorithm        omnimeshv1.LoadBalancerAlgorithm
@@ -771,6 +772,7 @@ func (r *Router) compileSnapshotLocked(cfg *routeConfig) *routeSnapshot {
 			namespace:        svc.Namespace,
 			serviceName:      svc.Name,
 			meshAddr:         meshIP,
+			protocol:         svc.Protocol,
 			defaultPort:      svc.Port,
 			defaultRealDest:  defaultRealDest,
 			algorithm:        algorithm,
@@ -1126,6 +1128,7 @@ func resolveFromPlan(
 				RealDest:    realDest,
 				Namespace:   plan.namespace,
 				ServiceName: plan.serviceName,
+				Protocol:    plan.protocol,
 			}, fallbackCfg, nil
 		}
 		return nil, plan.retry, domain.ErrNoRoute
@@ -1167,6 +1170,7 @@ func resolveFromPlan(
 		NodeID:      chosen.nodeID,
 		Namespace:   plan.namespace,
 		ServiceName: plan.serviceName,
+		Protocol:    plan.protocol,
 		EndpointKey: chosen.key,
 	}, plan.retry, nil
 }

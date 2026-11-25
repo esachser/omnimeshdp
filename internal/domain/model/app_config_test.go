@@ -34,6 +34,136 @@ func TestDefaultConfig(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("default config should be valid: %v", err)
 	}
+	if !cfg.HTTP.Enabled || !cfg.HTTP.Outbound.Enabled || !cfg.HTTP.Inbound.Enabled {
+		t.Fatalf("expected HTTP L7 outbound and inbound to be enabled by default")
+	}
+	if cfg.HTTP.SniffTimeout != "100ms" || cfg.HTTP.MaxSniffBytes != 4096 || cfg.HTTP.MaxHeaderBytes != 65536 {
+		t.Fatalf("unexpected default HTTP proxy limits: %+v", cfg.HTTP)
+	}
+	if cfg.HTTP.Tracing.TraceparentMode != "preserve" || cfg.HTTP.Tracing.RequestIDHeader != "x-request-id" {
+		t.Fatalf("unexpected default HTTP tracing config: %+v", cfg.HTTP.Tracing)
+	}
+	if cfg.HTTP.MeshHeaders.StripPrefixOnInbound != "x-omnimesh-" {
+		t.Fatalf("unexpected default inbound strip prefix: %q", cfg.HTTP.MeshHeaders.StripPrefixOnInbound)
+	}
+}
+
+func TestHTTPConfigFileEnvAndValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.json")
+	configJSON := `{
+		"spire": {"disabled": true},
+		"http": {
+			"enabled": true,
+			"outbound": {"enabled": true},
+			"inbound": {"enabled": false},
+			"sniff_timeout": "200ms",
+			"max_sniff_bytes": 2048,
+			"max_header_bytes": 32768,
+			"idle_timeout": "30s",
+			"fail_open": true,
+			"tracing": {
+				"traceparent_mode": "new_span",
+				"echo_response_headers": true
+			},
+			"mesh_headers": {
+				"allow_unverified_identity": false
+			},
+			"rules": [
+				{
+					"name": "add-env",
+					"phase": "request",
+					"direction": "outbound",
+					"action": "set",
+					"header": "x-env",
+					"value": "staging"
+				}
+			]
+		}
+	}`
+	if err := os.WriteFile(configFile, []byte(configJSON), 0644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	cfg, err := model.LoadConfig(configFile)
+	if err != nil {
+		t.Fatalf("failed to load HTTP config: %v", err)
+	}
+	if cfg.HTTP.Inbound.Enabled || !cfg.HTTP.FailOpen || cfg.HTTP.MaxSniffBytes != 2048 {
+		t.Fatalf("unexpected HTTP config parsed from JSON: %+v", cfg.HTTP)
+	}
+	if cfg.HTTP.Tracing.TraceparentMode != "new_span" || !cfg.HTTP.Tracing.EchoResponseHeaders {
+		t.Fatalf("unexpected HTTP tracing config: %+v", cfg.HTTP.Tracing)
+	}
+	if cfg.HTTP.MeshHeaders.ShouldAllowUnverifiedIdentity(cfg.Spire.Disabled) {
+		t.Fatalf("explicit allow_unverified_identity=false should override spire.disabled=true")
+	}
+
+	t.Setenv("HTTP_INBOUND_ENABLED", "true")
+	t.Setenv("HTTP_SNIFF_TIMEOUT", "150ms")
+	t.Setenv("HTTP_TRACING_MODE", "preserve")
+	t.Setenv("HTTP_TRACING_ECHO_RESPONSE", "false")
+	t.Setenv("HTTP_MESH_HEADERS_ENABLED", "false")
+
+	cfgEnv, err := model.LoadConfig(configFile)
+	if err != nil {
+		t.Fatalf("failed to load HTTP config with env overrides: %v", err)
+	}
+	if !cfgEnv.HTTP.Inbound.Enabled || cfgEnv.HTTP.SniffTimeout != "150ms" ||
+		cfgEnv.HTTP.Tracing.TraceparentMode != "preserve" || cfgEnv.HTTP.Tracing.EchoResponseHeaders ||
+		cfgEnv.HTTP.MeshHeaders.Enabled {
+		t.Fatalf("unexpected HTTP config after env overrides: %+v", cfgEnv.HTTP)
+	}
+
+	// Protocol normalization and validation failures
+	cases := []struct {
+		raw  string
+		want model.HTTPProtocol
+	}{
+		{"", model.ProtocolAuto},
+		{"auto", model.ProtocolAuto},
+		{"TCP", model.ProtocolTCP},
+		{"http", model.ProtocolHTTP},
+		{"http/1.1", model.ProtocolHTTP1},
+		{"HTTP2", model.ProtocolHTTP2},
+		{"h2c", model.ProtocolHTTP2},
+		{"grpc", model.ProtocolHTTP2},
+	}
+	for _, tc := range cases {
+		if got := model.NormalizeProtocol(tc.raw); got != tc.want {
+			t.Errorf("NormalizeProtocol(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	bad := model.DefaultConfig()
+	bad.HTTP.SniffTimeout = "0s"
+	if err := bad.Validate(); err == nil {
+		t.Errorf("expected validation error for 0s sniff_timeout")
+	}
+
+	bad = model.DefaultConfig()
+	bad.HTTP.SniffTimeout = "10s"
+	if err := bad.Validate(); err == nil {
+		t.Errorf("expected validation error for >5s sniff_timeout")
+	}
+
+	bad = model.DefaultConfig()
+	bad.HTTP.Tracing.TraceparentMode = "invalid"
+	if err := bad.Validate(); err == nil {
+		t.Errorf("expected validation error for invalid traceparent_mode")
+	}
+
+	bad = model.DefaultConfig()
+	bad.HTTP.Rules = []model.HeaderRule{{Name: "bad", Phase: "request", Action: "set", Header: "Content-Length", Value: "10"}}
+	if err := bad.Validate(); err == nil {
+		t.Errorf("expected validation error for forbidden header Content-Length")
+	}
+
+	bad = model.DefaultConfig()
+	bad.HTTP.Rules = []model.HeaderRule{{Name: "crlf", Phase: "request", Action: "set", Header: "x-test", Value: "a\r\nb"}}
+	if err := bad.Validate(); err == nil {
+		t.Errorf("expected validation error for CR/LF in rule value")
+	}
 }
 
 func TestLoadConfigFileAndEnv(t *testing.T) {
