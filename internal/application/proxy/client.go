@@ -183,11 +183,7 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	var clientTLS *tls.Config
 
 	if processor == nil {
-		if fallbackHost == "" {
-			log.Printf("No packet processor or target host configured for caller %s; closing connection\n", peerAddr)
-			return
-		}
-		s.singleTunnel(ctx, localConn, fallbackHost, "172.27.153.78:8000", "", nodeID, identity, clientTLS, defaultRetry.ConnectTimeout, httpBridge)
+		log.Printf("No packet processor configured for caller %s; closing connection\n", peerAddr)
 		return
 	}
 
@@ -211,15 +207,7 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	}
 
 	if pktInfo.IP == 0 || router == nil {
-		if fallbackHost == "" {
-			log.Printf("No router or fallback host configured for caller %s; closing connection\n", peerAddr)
-			return
-		}
-		realDest := "172.27.153.78:8000"
-		if pktInfo.IP != 0 {
-			realDest = formatIPv4Port(pktInfo.IP, pktInfo.Port)
-		}
-		s.singleTunnel(ctx, localConn, fallbackHost, realDest, "", nodeID, identity, clientTLS, defaultRetry.ConnectTimeout, httpBridge)
+		log.Printf("No IP information or router defined, closing connection")
 		return
 	}
 
