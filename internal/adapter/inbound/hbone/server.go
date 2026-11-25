@@ -8,14 +8,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/sockmark"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/inbound"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 // Server implements an HTTP/2 HBONE (CONNECT) tunnel server.
@@ -44,17 +43,26 @@ func NewServer(addr string, tlsConfig ...*tls.Config) *Server {
 		s.tlsConfig = tlsConfig[0].Clone()
 	}
 
-	h2Server := &http2.Server{
-		IdleTimeout: 120 * time.Second,
-	}
-
-	handler := h2c.NewHandler(s, h2Server)
 	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:        addr,
+		Handler:     s,
+		IdleTimeout: 120 * time.Second,
+		HTTP2:       &http.HTTP2Config{},
+		Protocols:   serverProtocols(s.tlsConfig != nil),
+		TLSConfig:   s.tlsConfig,
 	}
 
 	return s
+}
+
+func serverProtocols(useTLS bool) *http.Protocols {
+	protos := new(http.Protocols)
+	if useTLS {
+		protos.SetHTTP2(true)
+	} else {
+		protos.SetUnencryptedHTTP2(true)
+	}
+	return protos
 }
 
 // SetServices replaces the locally registered services used to resolve x-omnimesh-service-id.
@@ -148,6 +156,10 @@ func (s *Server) SetTLSConfig(tlsConfig *tls.Config) {
 	} else {
 		s.tlsConfig = nil
 	}
+	if s.httpServer != nil {
+		s.httpServer.TLSConfig = s.tlsConfig
+		s.httpServer.Protocols = serverProtocols(s.tlsConfig != nil)
+	}
 }
 
 // Start binds to the listener and serves HTTP/2 HBONE connections.
@@ -164,24 +176,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.listener = ln
 
 	if s.tlsConfig != nil {
-		hasH2 := false
-		for _, p := range s.tlsConfig.NextProtos {
-			if p == "h2" {
-				hasH2 = true
-				break
-			}
-		}
-		if !hasH2 {
+		if !slices.Contains(s.tlsConfig.NextProtos, "h2") {
 			s.tlsConfig.NextProtos = append([]string{"h2"}, s.tlsConfig.NextProtos...)
 		}
 		s.httpServer.TLSConfig = s.tlsConfig
-
-		h2Server := &http2.Server{
-			IdleTimeout: 120 * time.Second,
-		}
-		if err := http2.ConfigureServer(s.httpServer, h2Server); err != nil {
-			return err
-		}
+		s.httpServer.Protocols = serverProtocols(true)
 		ln = tls.NewListener(ln, s.tlsConfig)
 	}
 

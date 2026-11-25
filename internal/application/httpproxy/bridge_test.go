@@ -15,8 +15,6 @@ import (
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 type recordingObserverInterceptor struct {
@@ -68,11 +66,16 @@ func TestBridge_RejectsAndFailOpen(t *testing.T) {
 	}
 	defer backendLn.Close()
 
+	protos := new(http.Protocols)
+	protos.SetHTTP1(true)
+	protos.SetUnencryptedHTTP2(true)
 	srv := &http.Server{
-		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("backend-ok"))
-		}), &http2.Server{}),
+		}),
+		HTTP2:     &http.HTTP2Config{},
+		Protocols: protos,
 	}
 	go func() { _ = srv.Serve(backendLn) }()
 	defer srv.Close()

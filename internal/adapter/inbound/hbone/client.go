@@ -14,7 +14,6 @@ import (
 
 	"github.com/esachser/omnimeshdp/internal/adapter/sockmark"
 	"github.com/esachser/omnimeshdp/internal/domain"
-	"golang.org/x/net/http2"
 )
 
 const (
@@ -137,9 +136,14 @@ type Client struct {
 
 // NewClient constructs a new HBONE client supporting cleartext HTTP/2 (h2c) and mTLS.
 func NewClient() *Client {
-	transport := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+	protos := new(http.Protocols)
+	protos.SetUnencryptedHTTP2(true)
+
+	transport := &http.Transport{
+		Protocols:         protos,
+		HTTP2:             &http.HTTP2Config{},
+		ForceAttemptHTTP2: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// Mark proxy-originated sockets so Linux redirect rules skip them (no-op elsewhere).
 			d := net.Dialer{Control: sockmark.Control(sockmark.ProxyMark)}
 			return d.DialContext(ctx, network, addr)
@@ -176,12 +180,14 @@ func (c *Client) getClient(targetHost string, tlsConfig *tls.Config) (*http.Clie
 	protos := new(http.Protocols)
 	protos.SetHTTP2(true)
 
+	cfg := tlsConfig.Clone()
 	t := &http.Transport{
 		Protocols:       protos,
-		TLSClientConfig: tlsConfig,
+		HTTP2:           &http.HTTP2Config{},
+		TLSClientConfig: cfg,
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := net.Dialer{Control: sockmark.Control(sockmark.ProxyMark)}
-			return (&tls.Dialer{NetDialer: &d, Config: tlsConfig}).DialContext(ctx, network, addr)
+			return (&tls.Dialer{NetDialer: &d, Config: cfg}).DialContext(ctx, network, addr)
 		},
 		ForceAttemptHTTP2: true,
 	}

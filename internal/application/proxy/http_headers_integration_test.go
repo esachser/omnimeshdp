@@ -24,8 +24,6 @@ import (
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -633,12 +631,17 @@ func TestE2E_HTTP2_CustomInterceptorRejection(t *testing.T) {
 	}
 	defer backendLn.Close()
 
+	protos := new(http.Protocols)
+	protos.SetUnencryptedHTTP2(true)
+
 	srv := &http.Server{
-		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			hits.Add(1)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
-		}), &http2.Server{}),
+		}),
+		HTTP2:     &http.HTTP2Config{},
+		Protocols: protos,
 	}
 	go func() { _ = srv.Serve(backendLn) }()
 	defer srv.Close()
@@ -646,9 +649,11 @@ func TestE2E_HTTP2_CustomInterceptorRejection(t *testing.T) {
 	h := startMTLSMeshHarness(t, model.DefaultHTTPConfig(), true, "", "h2c", backendLn.Addr().(*net.TCPAddr).Port, &h2CustomInterceptor{})
 
 	h2Client := &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+		Transport: &http.Transport{
+			Protocols:         protos,
+			HTTP2:             &http.HTTP2Config{},
+			ForceAttemptHTTP2: true,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", h.clientAddr)
 			},
 		},

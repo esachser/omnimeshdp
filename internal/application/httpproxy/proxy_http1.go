@@ -11,8 +11,12 @@ import (
 )
 
 func (b *Bridge) proxyHTTP1(ctx context.Context, downstream net.Conn, upstream net.Conn, meta model.ConnectionMeta) error {
+	var protos http.Protocols
+	protos.SetHTTP1(true)
+
 	var dialOnce sync.Once
 	tr := &http.Transport{
+		Protocols:           &protos,
 		DisableCompression:  true,
 		MaxIdleConns:        1,
 		MaxIdleConnsPerHost: 1,
@@ -33,9 +37,6 @@ func (b *Bridge) proxyHTTP1(ctx context.Context, downstream net.Conn, upstream n
 
 	ln := newSingleConnListener(ctx, downstream)
 	defer ln.Close()
-
-	var protos http.Protocols
-	protos.SetHTTP1(true)
 
 	srv := &http.Server{
 		Handler:        b.newReverseProxyHandler(tr, meta),

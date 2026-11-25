@@ -9,12 +9,6 @@ import (
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 )
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
 func (b *Bridge) proxyHTTP2(ctx context.Context, downstream net.Conn, upstream net.Conn, meta model.ConnectionMeta) error {
 	protos := new(http.Protocols)
 	protos.SetUnencryptedHTTP2(true)
@@ -37,7 +31,10 @@ func (b *Bridge) proxyHTTP2(ctx context.Context, downstream net.Conn, upstream n
 		Handler:        b.newReverseProxyHandler(h2Transport, meta),
 		MaxHeaderBytes: b.cfg.MaxHeaderBytes,
 		IdleTimeout:    b.idleTimeout,
-		Protocols:      protos,
+		HTTP2: &http.HTTP2Config{
+			MaxReadFrameSize: 1 << 20,
+		},
+		Protocols: protos,
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
