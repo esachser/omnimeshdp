@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"uuid"
 
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http/httpguts"
@@ -162,7 +162,7 @@ func (i *TraceContextInterceptor) processRequestID(req *model.HTTPRequestContext
 	if !i.cfg.GenerateRequestID {
 		return
 	}
-	id := uuid.NewString()
+	id := uuid.NewV4().String()
 	req.Headers.Set(i.requestIDHeader, id)
 	req.RequestID = id
 }

@@ -6,7 +6,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.4
 	github.com/esachser/omnimeshcontrol v0.0.0
 	github.com/fsnotify/fsnotify v1.10.1
-	github.com/google/uuid v1.6.0
 	github.com/spiffe/go-spiffe/v2 v2.9.0
 	github.com/spiffe/spire-api-sdk v1.16.0
 	go.opentelemetry.io/otel v1.47.0
