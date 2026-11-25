@@ -24,8 +24,6 @@ import (
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
 	"github.com/esachser/omnimeshdp/internal/application/proxy"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
@@ -222,7 +220,33 @@ func TestClientSideService_ImpersonatesCallingProcessByPID(t *testing.T) {
 		errByPID:  make(map[uint64]error),
 	}
 
-	clientService := proxy.NewClientSideService(clientAddr, serverAddr, mockProc)
+	router := proxy.NewRouter()
+	router.ApplySnapshot(&omnimeshv1.ScopeSnapshot{
+		Services: []*omnimeshv1.ServiceInfo{
+			{
+				Namespace: "production",
+				Name:      "payment-service",
+				MeshAddr:  "127.0.0.1",
+				Port:      int32(echoPort),
+			},
+		},
+		Routes: []*omnimeshv1.RouteInfo{
+			{
+				Namespace:   "production",
+				ServiceName: "payment-service",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{
+						NodeId:    "target-node",
+						RouteName: "payment-v1",
+						Addr:      serverAddr,
+					},
+				},
+			},
+		},
+	})
+
+	clientService := proxy.NewClientSideService(clientAddr, "", mockProc)
+	clientService.SetRouter(router)
 	clientService.SetWorkloadSVIDProvider(svidProv)
 
 	go func() {
@@ -294,7 +318,33 @@ func TestClientSideService_RejectsWhenSVIDFails(t *testing.T) {
 		},
 	}
 
-	clientService := proxy.NewClientSideService(clientAddr, serverListener.Addr().String(), mockProc)
+	router := proxy.NewRouter()
+	router.ApplySnapshot(&omnimeshv1.ScopeSnapshot{
+		Services: []*omnimeshv1.ServiceInfo{
+			{
+				Namespace: "production",
+				Name:      "payment-service",
+				MeshAddr:  "127.0.0.1",
+				Port:      8080,
+			},
+		},
+		Routes: []*omnimeshv1.RouteInfo{
+			{
+				Namespace:   "production",
+				ServiceName: "payment-service",
+				TargetNodes: []*omnimeshv1.NodeEndpointInfo{
+					{
+						NodeId:    "target-node",
+						RouteName: "payment-v1",
+						Addr:      serverListener.Addr().String(),
+					},
+				},
+			},
+		},
+	})
+
+	clientService := proxy.NewClientSideService(clientAddr, "", mockProc)
+	clientService.SetRouter(router)
 	clientService.SetWorkloadSVIDProvider(svidProv)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -373,11 +423,15 @@ func startCountedHTTP2Server(t *testing.T, ctx context.Context, handler http.Han
 		t.Fatalf("failed to listen: %v", err)
 	}
 	var hits atomic.Int32
+	protos := new(http.Protocols)
+	protos.SetUnencryptedHTTP2(true)
 	srv := &http.Server{
-		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			hits.Add(1)
 			handler.ServeHTTP(w, r)
-		}), &http2.Server{}),
+		}),
+		HTTP2:     &http.HTTP2Config{},
+		Protocols: protos,
 	}
 	go func() {
 		_ = srv.Serve(ln)

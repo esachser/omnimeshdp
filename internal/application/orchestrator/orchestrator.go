@@ -16,6 +16,7 @@ import (
 	adaptergrpc "github.com/esachser/omnimeshdp/internal/adapter/outbound/grpc"
 	"github.com/esachser/omnimeshdp/internal/adapter/outbound/spiffe"
 	"github.com/esachser/omnimeshdp/internal/application/agent"
+	"github.com/esachser/omnimeshdp/internal/application/httpproxy"
 	"github.com/esachser/omnimeshdp/internal/application/proxy"
 	"github.com/esachser/omnimeshdp/internal/application/service"
 	"github.com/esachser/omnimeshdp/internal/domain"
@@ -52,6 +53,7 @@ type Orchestrator struct {
 	cpClientFactory  ControlPlaneClientFactory
 	listenerOpener   ListenerOpener
 	retryInterval    time.Duration
+	httpInterceptors []outbound.HeaderInterceptor
 
 	// Internal state across steps
 	runCtx             context.Context
@@ -140,6 +142,13 @@ func WithListenerOpener(fn ListenerOpener) Option {
 func WithRetryInterval(interval time.Duration) Option {
 	return func(o *Orchestrator) {
 		o.retryInterval = interval
+	}
+}
+
+// WithHTTPInterceptors attaches custom Go HeaderInterceptors to both outbound and inbound HTTP L7 proxies.
+func WithHTTPInterceptors(interceptors ...outbound.HeaderInterceptor) Option {
+	return func(o *Orchestrator) {
+		o.httpInterceptors = append(o.httpInterceptors, interceptors...)
 	}
 }
 
@@ -263,6 +272,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 	o.clientSideService = proxy.NewClientSideService(o.config.Listeners.InternalAddr, "", nil)
 	o.clientSideService.SetRouter(o.router)
+	o.clientSideService.SetNodeID(o.config.ControlPlane.NodeID)
 	if err := o.clientSideService.SetRoutingConfig(o.config.Routing); err != nil {
 		log.Printf("[Step 3/10] Warning: invalid client routing configuration, using defaults: %v\n", err)
 	}
@@ -279,6 +289,16 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		}
 	}
 	o.serverSideService = proxy.NewServerSideService(o.config.Listeners.ExternalAddr, serverTLS)
+	o.serverSideService.SetNodeID(o.config.ControlPlane.NodeID)
+
+	if httpBridge, err := o.buildHTTPBridge(); err != nil {
+		_ = intLn.Close()
+		_ = extLn.Close()
+		return fmt.Errorf("%w: %w", domain.ErrConfigLoadFailed, err)
+	} else if httpBridge != nil {
+		o.clientSideService.SetHTTPBridge(httpBridge)
+		o.serverSideService.SetHTTPBridge(httpBridge)
+	}
 
 	o.wg.Add(1)
 	go func() {
@@ -733,4 +753,17 @@ func normalizeSubnetList(subnets []string) []string {
 	}
 	slices.Sort(cp)
 	return slices.Compact(cp)
+}
+
+func (o *Orchestrator) buildHTTPBridge() (*httpproxy.Bridge, error) {
+	httpCfg := o.config.HTTP
+	isZero := !httpCfg.Enabled &&
+		httpCfg.SniffTimeout == "" &&
+		httpCfg.MaxSniffBytes == 0 &&
+		httpCfg.MaxHeaderBytes == 0 &&
+		len(o.httpInterceptors) == 0
+	if isZero {
+		return nil, nil
+	}
+	return httpproxy.NewBridge(httpCfg, o.config.Spire.Disabled, o.httpInterceptors...)
 }

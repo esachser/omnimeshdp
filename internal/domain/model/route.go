@@ -31,6 +31,7 @@ type ResolvedRoute struct {
 	NodeID      string      // The target node ID (e.g. "node-2")
 	Namespace   string      // The destination service namespace
 	ServiceName string      // The destination service name
+	Protocol    string      // Service protocol hint from ServiceInfo.Protocol (e.g. "http", "http2", "grpc", "tcp")
 	EndpointKey EndpointKey // Canonical key identifying the selected endpoint
 }
 

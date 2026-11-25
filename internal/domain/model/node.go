@@ -14,6 +14,7 @@ type NodeServiceInfo struct {
 	ID          string             `json:"id"`
 	Host        string             `json:"host,omitempty"`
 	Port        int                `json:"port,omitempty"`
+	Protocol    string             `json:"protocol,omitempty"`
 	Labels      map[string]string  `json:"labels"`
 	HealthCheck *HealthCheckConfig `json:"health_check,omitempty"`
 }
@@ -49,7 +50,8 @@ func (s NodeServiceInfo) Key() string {
 
 // Equal checks equality of two NodeServiceInfo objects.
 func (s NodeServiceInfo) Equal(other NodeServiceInfo) bool {
-	if s.Namespace != other.Namespace || s.Name != other.Name || s.ID != other.ID || s.Host != other.Host || s.Port != other.Port {
+	if s.Namespace != other.Namespace || s.Name != other.Name || s.ID != other.ID ||
+		s.Host != other.Host || s.Port != other.Port || s.Protocol != other.Protocol {
 		return false
 	}
 	if !maps.Equal(s.Labels, other.Labels) {

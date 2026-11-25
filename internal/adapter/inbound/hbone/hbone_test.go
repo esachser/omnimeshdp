@@ -24,8 +24,6 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 func TestHBONETunnelEcho(t *testing.T) {
@@ -452,11 +450,14 @@ func TestHBONEOpenTunnel_StatusErrorsAndTimeoutLifetime(t *testing.T) {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	defer forbiddenLn.Close()
-	h2Srv := &http2.Server{}
+	h2Protos := new(http.Protocols)
+	h2Protos.SetUnencryptedHTTP2(true)
 	forbiddenHTTP := &http.Server{
-		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
-		}), h2Srv),
+		}),
+		HTTP2:     &http.HTTP2Config{},
+		Protocols: h2Protos,
 	}
 	go func() { _ = forbiddenHTTP.Serve(forbiddenLn) }()
 	defer forbiddenHTTP.Close()
@@ -526,9 +527,11 @@ func TestHBONEOpenTunnel_StatusErrorsAndTimeoutLifetime(t *testing.T) {
 	stalledRelease := make(chan struct{})
 	defer close(stalledRelease)
 	stalledHTTP := &http.Server{
-		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			<-stalledRelease
-		}), &http2.Server{}),
+		}),
+		HTTP2:     &http.HTTP2Config{},
+		Protocols: h2Protos,
 	}
 	go func() { _ = stalledHTTP.Serve(stalledLn) }()
 	defer stalledHTTP.Close()
@@ -541,4 +544,109 @@ func TestHBONEOpenTunnel_StatusErrorsAndTimeoutLifetime(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("expected timeout around 60ms, took %v", elapsed)
 	}
+}
+
+func TestHBONEServer_EnforcesHTTP2ProtocolAndSetTLSConfig(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h1Protos := new(http.Protocols)
+	h1Protos.SetHTTP1(true)
+
+	t.Run("cleartext server rejects HTTP/1.1 requests", func(t *testing.T) {
+		hbLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		server := hbone.NewServer(hbLn.Addr().String())
+		go func() { _ = server.Serve(ctx, hbLn) }()
+
+		h1Client := &http.Client{
+			Timeout:   2 * time.Second,
+			Transport: &http.Transport{Protocols: h1Protos},
+		}
+		defer h1Client.CloseIdleConnections()
+
+		resp, err := h1Client.Get("http://" + hbLn.Addr().String() + "/")
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Fatalf("expected HTTP/1.1 request to be rejected, got status %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("SetTLSConfig switches server to mTLS HTTP/2 only", func(t *testing.T) {
+		echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to start echo listener: %v", err)
+		}
+		defer echoLn.Close()
+		go func() {
+			for {
+				c, err := echoLn.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					_, _ = io.Copy(conn, conn)
+				}(c)
+			}
+		}()
+
+		td := spiffeid.RequireTrustDomainFromString("omnimesh.local")
+		caCert, caKey, bundle := createTestCA(t)
+		serverSVID := createTestSPIFFEWorkloadSVID(t, caCert, caKey, "spiffe://omnimesh.local/ns/omnimesh-system/sa/srv")
+		clientSVID := createTestSPIFFEWorkloadSVID(t, caCert, caKey, "spiffe://omnimesh.local/ns/prod/sa/cli")
+		serverTLS := tlsconfig.MTLSServerConfig(serverSVID, bundle, tlsconfig.AuthorizeMemberOf(td))
+		clientTLS := tlsconfig.MTLSClientConfig(clientSVID, bundle, tlsconfig.AuthorizeMemberOf(td))
+
+		hbLn, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		hbAddr := hbLn.Addr().String()
+
+		server := hbone.NewServer(hbAddr)
+		server.SetTLSConfig(serverTLS)
+		go func() { _ = server.Serve(ctx, hbLn) }()
+
+		h1TLSClient := &http.Client{
+			Timeout: 2 * time.Second,
+			Transport: &http.Transport{
+				Protocols:       h1Protos,
+				TLSClientConfig: clientTLS.Clone(),
+			},
+		}
+		defer h1TLSClient.CloseIdleConnections()
+
+		if resp, err := h1TLSClient.Get("https://" + hbAddr + "/"); err == nil {
+			_ = resp.Body.Close()
+			t.Fatalf("expected TLS HTTP/1.1 request to be rejected, got status %d", resp.StatusCode)
+		}
+
+		client := hbone.NewClient()
+		tunnel, err := client.OpenTunnelWithTimeout(ctx, 2*time.Second, hbAddr, echoLn.Addr().String(), "", clientSVID.ID.String(), clientTLS)
+		if err != nil {
+			t.Fatalf("expected mTLS HBONE tunnel after SetTLSConfig, got: %v", err)
+		}
+		defer tunnel.Close()
+
+		clientSide, proxySide := net.Pipe()
+		defer clientSide.Close()
+		defer proxySide.Close()
+		go func() { _ = tunnel.Bridge(proxySide) }()
+
+		msg := []byte("mTLS via SetTLSConfig")
+		if _, err := clientSide.Write(msg); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		buf := make([]byte, len(msg))
+		_ = clientSide.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.ReadFull(clientSide, buf); err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		if string(buf) != string(msg) {
+			t.Fatalf("echo mismatch: got %q, want %q", string(buf), string(msg))
+		}
+	})
 }

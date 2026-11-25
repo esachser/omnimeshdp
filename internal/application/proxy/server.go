@@ -43,6 +43,16 @@ func (s *ServerSideService) UpdateServices(added, removed []model.NodeServiceInf
 	s.server.UpdateServices(added, removed)
 }
 
+// SetNodeID configures the local node ID attached to inbound HTTP metadata.
+func (s *ServerSideService) SetNodeID(nodeID string) {
+	s.server.SetNodeID(nodeID)
+}
+
+// SetHTTPBridge configures an L7 HTTPStreamBridge for inbound HTTP/1.1 and HTTP/2 inspection.
+func (s *ServerSideService) SetHTTPBridge(bridge inbound.HTTPStreamBridge) {
+	s.server.SetHTTPBridge(bridge)
+}
+
 // Start runs the HBONE server until context cancellation.
 func (s *ServerSideService) Start(ctx context.Context) error {
 	return s.server.Start(ctx)

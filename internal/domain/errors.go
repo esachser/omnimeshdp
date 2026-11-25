@@ -49,7 +49,31 @@ var (
 	ErrPacketProcessorInitFailed    = errors.New("step 7 failed: could not configure packet processor filtering")
 	ErrDeployServicesFailed         = errors.New("step 8 failed: could not read services to deploy")
 	ErrControlPlaneStreamingFailed  = errors.New("step 9 failed: control plane streaming interrupted")
+
+	// HTTP L7 inspection/injection errors per spec/http-headers.md
+	ErrInvalidHTTPConfig = errors.New("invalid HTTP L7 configuration")
+	ErrInvalidHeader     = errors.New("invalid HTTP header")
 )
+
+// HTTPRejectError may be returned by an HTTP request interceptor to reject a request
+// immediately with an HTTP status code, message, and optional response headers.
+type HTTPRejectError struct {
+	StatusCode int
+	Message    string
+	Headers    http.Header
+}
+
+// Error implements the error interface.
+func (e *HTTPRejectError) Error() string {
+	status := e.StatusCode
+	if status <= 0 {
+		status = http.StatusForbidden
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("request rejected with status %d: %s", status, e.Message)
+	}
+	return fmt.Sprintf("request rejected with status %d", status)
+}
 
 // TunnelStatusError represents a non-200 HTTP status returned by a peer agent
 // during HBONE CONNECT handshake.

@@ -27,11 +27,13 @@ var _ inbound.ProxyService = (*ClientSideService)(nil)
 type ClientSideService struct {
 	listenAddr      string
 	targetHost      string
+	nodeID          string
 	mu              sync.RWMutex
 	packetProcessor outbound.PacketProcessor
 	hboneClient     *hbone.Client
 	router          *Router
 	svidProvider    outbound.WorkloadSVIDProvider
+	httpBridge      inbound.HTTPStreamBridge
 	defaultRetry    model.RetryConfig
 }
 
@@ -90,6 +92,20 @@ func (s *ClientSideService) SetWorkloadSVIDProvider(p outbound.WorkloadSVIDProvi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.svidProvider = p
+}
+
+// SetNodeID configures the local node ID attached to outbound HBONE/HTTP metadata.
+func (s *ClientSideService) SetNodeID(nodeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nodeID = nodeID
+}
+
+// SetHTTPBridge configures an L7 HTTPStreamBridge for outbound HTTP/1.1 and HTTP/2 inspection.
+func (s *ClientSideService) SetHTTPBridge(bridge inbound.HTTPStreamBridge) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.httpBridge = bridge
 }
 
 // WorkloadSVIDProvider returns the active WorkloadSVIDProvider, or nil if none is configured.
@@ -159,17 +175,15 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	svidProv := s.svidProvider
 	fallbackHost := s.targetHost
 	defaultRetry := s.defaultRetry
+	nodeID := s.nodeID
+	httpBridge := s.httpBridge
 	s.mu.RUnlock()
 
 	var identity string
 	var clientTLS *tls.Config
 
 	if processor == nil {
-		if fallbackHost == "" {
-			log.Printf("No packet processor or target host configured for caller %s; closing connection\n", peerAddr)
-			return
-		}
-		s.singleTunnel(ctx, localConn, fallbackHost, "172.27.153.78:8000", "", identity, clientTLS, defaultRetry.ConnectTimeout)
+		log.Printf("No packet processor configured for caller %s; closing connection\n", peerAddr)
 		return
 	}
 
@@ -193,19 +207,11 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	}
 
 	if pktInfo.IP == 0 || router == nil {
-		if fallbackHost == "" {
-			log.Printf("No router or fallback host configured for caller %s; closing connection\n", peerAddr)
-			return
-		}
-		realDest := "172.27.153.78:8000"
-		if pktInfo.IP != 0 {
-			realDest = formatIPv4Port(pktInfo.IP, pktInfo.Port)
-		}
-		s.singleTunnel(ctx, localConn, fallbackHost, realDest, "", identity, clientTLS, defaultRetry.ConnectTimeout)
+		log.Printf("No IP information or router defined, closing connection")
 		return
 	}
 
-	_ = s.tunnelWithRetries(ctx, localConn, router, pktInfo.IP, pktInfo.Port, fallbackHost, identity, clientTLS, defaultRetry)
+	_ = s.tunnelWithRetries(ctx, localConn, router, pktInfo.IP, pktInfo.Port, fallbackHost, nodeID, identity, clientTLS, defaultRetry, httpBridge)
 }
 
 func (s *ClientSideService) singleTunnel(
@@ -214,9 +220,11 @@ func (s *ClientSideService) singleTunnel(
 	targetHost string,
 	realDest string,
 	nodeServiceID string,
+	sourceNodeID string,
 	identity string,
 	clientTLS *tls.Config,
 	connectTimeout time.Duration,
+	httpBridge inbound.HTTPStreamBridge,
 ) {
 	if connectTimeout <= 0 {
 		connectTimeout = model.DefaultConnectTimeout
@@ -231,12 +239,28 @@ func (s *ClientSideService) singleTunnel(
 		clientTLS != nil,
 	)
 
-	tunnel, err := s.hboneClient.OpenTunnelWithTimeout(ctx, connectTimeout, targetHost, realDest, nodeServiceID, identity, clientTLS)
+	tunnel, err := s.hboneClient.OpenTunnelWithOptions(ctx, hbone.TunnelOptions{
+		ConnectTimeout: connectTimeout,
+		TargetHost:     targetHost,
+		RealDest:       realDest,
+		NodeServiceID:  nodeServiceID,
+		SourceNodeID:   sourceNodeID,
+		Identity:       identity,
+		TLSConfig:      clientTLS,
+	})
 	if err != nil {
 		log.Printf("Tunnel error: %v\n", err)
 		return
 	}
-	if err := tunnel.Bridge(localConn); err != nil {
+	if err := bridgeOutboundTunnel(ctx, httpBridge, tunnel, localConn, model.ConnectionMeta{
+		Direction:      model.DirectionOutbound,
+		SourceNodeID:   sourceNodeID,
+		CallerIdentity: identity,
+		CallerVerified: clientTLS != nil && identity != "",
+		SourceAddr:     localConn.RemoteAddr().String(),
+		DestAddr:       realDest,
+		NodeServiceID:  nodeServiceID,
+	}); err != nil {
 		log.Printf("Tunnel bridge error: %v\n", err)
 	}
 }
@@ -248,9 +272,11 @@ func (s *ClientSideService) tunnelWithRetries(
 	destIP uint32,
 	destPort uint16,
 	fallbackHost string,
+	sourceNodeID string,
 	identity string,
 	clientTLS *tls.Config,
 	defaultRetry model.RetryConfig,
+	httpBridge inbound.HTTPStreamBridge,
 ) error {
 	var excludedBuf [8]model.EndpointKey
 	excluded := excludedBuf[:0]
@@ -293,18 +319,31 @@ func (s *ClientSideService) tunnelWithRetries(
 			clientTLS != nil,
 		)
 
-		tunnel, err := s.hboneClient.OpenTunnelWithTimeout(
-			ctx,
-			connectTimeout,
-			resolved.TargetHost,
-			resolved.RealDest,
-			resolved.ServiceID,
-			identity,
-			clientTLS,
-		)
+		tunnel, err := s.hboneClient.OpenTunnelWithOptions(ctx, hbone.TunnelOptions{
+			ConnectTimeout: connectTimeout,
+			TargetHost:     resolved.TargetHost,
+			RealDest:       resolved.RealDest,
+			NodeServiceID:  resolved.ServiceID,
+			SourceNodeID:   sourceNodeID,
+			Identity:       identity,
+			TLSConfig:      clientTLS,
+		})
 		if err == nil {
 			defer release()
-			if bridgeErr := tunnel.Bridge(localConn); bridgeErr != nil {
+			meta := model.ConnectionMeta{
+				Direction:       model.DirectionOutbound,
+				ConfiguredProto: model.NormalizeProtocol(resolved.Protocol),
+				SourceNodeID:    sourceNodeID,
+				DestNodeID:      resolved.NodeID,
+				CallerIdentity:  identity,
+				CallerVerified:  clientTLS != nil && identity != "",
+				SourceAddr:      localConn.RemoteAddr().String(),
+				DestAddr:        resolved.RealDest,
+				Namespace:       resolved.Namespace,
+				ServiceName:     resolved.ServiceName,
+				NodeServiceID:   resolved.ServiceID,
+			}
+			if bridgeErr := bridgeOutboundTunnel(ctx, httpBridge, tunnel, localConn, meta); bridgeErr != nil {
 				log.Printf("Tunnel bridge error: %v\n", bridgeErr)
 				return bridgeErr
 			}
@@ -342,6 +381,20 @@ func (s *ClientSideService) tunnelWithRetries(
 			}
 		}
 	}
+}
+
+func bridgeOutboundTunnel(
+	ctx context.Context,
+	httpBridge inbound.HTTPStreamBridge,
+	tunnel *hbone.Tunnel,
+	localConn net.Conn,
+	meta model.ConnectionMeta,
+) error {
+	if httpBridge != nil {
+		defer tunnel.Close()
+		return httpBridge.Bridge(ctx, localConn, tunnel.Conn(), meta)
+	}
+	return tunnel.Bridge(localConn)
 }
 
 func isRetryableRouteError(ctx context.Context, err error, cfg model.RetryConfig) bool {

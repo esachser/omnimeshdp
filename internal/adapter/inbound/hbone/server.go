@@ -8,13 +8,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/sockmark"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"github.com/esachser/omnimeshdp/internal/port/inbound"
 )
 
 // Server implements an HTTP/2 HBONE (CONNECT) tunnel server.
@@ -25,7 +25,10 @@ type Server struct {
 	tlsConfig    *tls.Config
 	svcMu        sync.RWMutex
 	services     map[string]model.NodeServiceInfo // keyed by NodeServiceInfo.Key()
-	servicesByID map[string]string                // serviceID -> "host:port"
+	servicesByID map[string]model.NodeServiceInfo // serviceID -> NodeServiceInfo
+	cfgMu        sync.RWMutex
+	nodeID       string
+	httpBridge   inbound.HTTPStreamBridge
 }
 
 // NewServer creates a new HBONE server listening on the specified address.
@@ -34,23 +37,32 @@ func NewServer(addr string, tlsConfig ...*tls.Config) *Server {
 	s := &Server{
 		addr:         addr,
 		services:     make(map[string]model.NodeServiceInfo),
-		servicesByID: make(map[string]string),
+		servicesByID: make(map[string]model.NodeServiceInfo),
 	}
 	if len(tlsConfig) > 0 && tlsConfig[0] != nil {
 		s.tlsConfig = tlsConfig[0].Clone()
 	}
 
-	h2Server := &http2.Server{
-		IdleTimeout: 120 * time.Second,
-	}
-
-	handler := h2c.NewHandler(s, h2Server)
 	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:        addr,
+		Handler:     s,
+		IdleTimeout: 120 * time.Second,
+		HTTP2:       &http.HTTP2Config{},
+		Protocols:   serverProtocols(s.tlsConfig != nil),
+		TLSConfig:   s.tlsConfig,
 	}
 
 	return s
+}
+
+func serverProtocols(useTLS bool) *http.Protocols {
+	protos := new(http.Protocols)
+	if useTLS {
+		protos.SetHTTP2(true)
+	} else {
+		protos.SetUnencryptedHTTP2(true)
+	}
+	return protos
 }
 
 // SetServices replaces the locally registered services used to resolve x-omnimesh-service-id.
@@ -83,34 +95,58 @@ func (s *Server) UpdateServices(added, removed []model.NodeServiceInfo) {
 }
 
 func (s *Server) rebuildServiceIndexLocked() {
-	idx := make(map[string]string, len(s.services)*2)
+	idx := make(map[string]model.NodeServiceInfo, len(s.services)*2)
 	for _, svc := range s.services {
 		addr := svc.Address()
 		if addr == "" {
 			continue
 		}
 		if svc.ID != "" {
-			idx[svc.ID] = addr
+			idx[svc.ID] = svc
 		}
-		idx[svc.Key()] = addr
+		idx[svc.Key()] = svc
 		if svc.Name != "" {
 			if _, exists := idx[svc.Name]; !exists {
-				idx[svc.Name] = addr
+				idx[svc.Name] = svc
 			}
 		}
 	}
 	s.servicesByID = idx
 }
 
-// ResolveServiceAddr looks up the local "host:port" address for a given service ID.
-func (s *Server) ResolveServiceAddr(serviceID string) (string, bool) {
+// ResolveService looks up the locally registered NodeServiceInfo for a given service ID.
+func (s *Server) ResolveService(serviceID string) (model.NodeServiceInfo, bool) {
 	if serviceID == "" {
-		return "", false
+		return model.NodeServiceInfo{}, false
 	}
 	s.svcMu.RLock()
 	defer s.svcMu.RUnlock()
-	addr, ok := s.servicesByID[serviceID]
-	return addr, ok
+	svc, ok := s.servicesByID[serviceID]
+	return svc, ok
+}
+
+// ResolveServiceAddr looks up the local "host:port" address for a given service ID.
+func (s *Server) ResolveServiceAddr(serviceID string) (string, bool) {
+	svc, ok := s.ResolveService(serviceID)
+	if !ok {
+		return "", false
+	}
+	addr := svc.Address()
+	return addr, addr != ""
+}
+
+// SetNodeID configures the local node ID attached to inbound HTTP ConnectionMeta.
+func (s *Server) SetNodeID(nodeID string) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.nodeID = nodeID
+}
+
+// SetHTTPBridge configures an L7 HTTPStreamBridge for inbound HTTP/1.1 and HTTP/2 inspection.
+func (s *Server) SetHTTPBridge(bridge inbound.HTTPStreamBridge) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.httpBridge = bridge
 }
 
 // SetTLSConfig updates the server's mTLS configuration.
@@ -119,6 +155,10 @@ func (s *Server) SetTLSConfig(tlsConfig *tls.Config) {
 		s.tlsConfig = tlsConfig.Clone()
 	} else {
 		s.tlsConfig = nil
+	}
+	if s.httpServer != nil {
+		s.httpServer.TLSConfig = s.tlsConfig
+		s.httpServer.Protocols = serverProtocols(s.tlsConfig != nil)
 	}
 }
 
@@ -136,24 +176,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.listener = ln
 
 	if s.tlsConfig != nil {
-		hasH2 := false
-		for _, p := range s.tlsConfig.NextProtos {
-			if p == "h2" {
-				hasH2 = true
-				break
-			}
-		}
-		if !hasH2 {
+		if !slices.Contains(s.tlsConfig.NextProtos, "h2") {
 			s.tlsConfig.NextProtos = append([]string{"h2"}, s.tlsConfig.NextProtos...)
 		}
 		s.httpServer.TLSConfig = s.tlsConfig
-
-		h2Server := &http2.Server{
-			IdleTimeout: 120 * time.Second,
-		}
-		if err := http2.ConfigureServer(s.httpServer, h2Server); err != nil {
-			return err
-		}
+		s.httpServer.Protocols = serverProtocols(true)
 		ln = tls.NewListener(ln, s.tlsConfig)
 	}
 
@@ -187,11 +214,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	nodeServiceID := r.Header.Get(HeaderNodeServiceID)
 	realDest := r.Header.Get(HeaderRealDest)
+	sourceNodeID := r.Header.Get(HeaderSourceNode)
 
 	destAddr := realDest
+	var resolvedSvc model.NodeServiceInfo
 	if nodeServiceID != "" {
-		if resolvedAddr, ok := s.ResolveServiceAddr(nodeServiceID); ok && resolvedAddr != "" {
-			destAddr = resolvedAddr
+		if svc, ok := s.ResolveService(nodeServiceID); ok {
+			if resolvedAddr := svc.Address(); resolvedAddr != "" {
+				destAddr = resolvedAddr
+				resolvedSvc = svc
+			}
 		}
 	}
 
@@ -201,10 +233,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var callerIdentity string
+	callerVerified := false
 	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 		peerCert := r.TLS.PeerCertificates[0]
 		if len(peerCert.URIs) > 0 {
 			callerIdentity = peerCert.URIs[0].String()
+			callerVerified = callerIdentity != ""
 		}
 	}
 	if callerIdentity == "" {
@@ -233,6 +267,43 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flusher, hasFlusher := w.(http.Flusher)
 	if hasFlusher {
 		flusher.Flush()
+	}
+
+	s.cfgMu.RLock()
+	httpBridge := s.httpBridge
+	nodeID := s.nodeID
+	s.cfgMu.RUnlock()
+
+	if httpBridge != nil {
+		var localAddr net.Addr
+		if s.listener != nil {
+			localAddr = s.listener.Addr()
+		}
+		hboneConn := newHBONEStreamConn(r.Body, w, flusher, r.RemoteAddr, localAddr)
+		defer hboneConn.Close()
+
+		svcID := resolvedSvc.ID
+		if svcID == "" {
+			svcID = nodeServiceID
+		}
+		meta := model.ConnectionMeta{
+			Direction:       model.DirectionInbound,
+			ConfiguredProto: model.NormalizeProtocol(resolvedSvc.Protocol),
+			SourceNodeID:    sourceNodeID,
+			DestNodeID:      nodeID,
+			CallerIdentity:  callerIdentity,
+			CallerVerified:  callerVerified,
+			SourceAddr:      r.RemoteAddr,
+			DestAddr:        destAddr,
+			Namespace:       resolvedSvc.Namespace,
+			ServiceName:     resolvedSvc.Name,
+			NodeServiceID:   svcID,
+			ServiceLabels:   resolvedSvc.Labels,
+		}
+		if err := httpBridge.Bridge(r.Context(), hboneConn, targetConn, meta); err != nil {
+			log.Printf("Inbound HTTP bridge error for %s: %v\n", destAddr, err)
+		}
+		return
 	}
 
 	var wg sync.WaitGroup
@@ -269,3 +340,67 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 	}
 	return
 }
+
+// hboneStreamConn adapts an inbound HTTP/2 HBONE CONNECT stream (r.Body + ResponseWriter)
+// into a thread-safe net.Conn for the shared L7 HTTPStreamBridge.
+type hboneStreamConn struct {
+	reader     *deadlineReader
+	w          http.ResponseWriter
+	flusher    http.Flusher
+	remoteAddr net.Addr
+	localAddr  net.Addr
+
+	writeMu sync.Mutex
+	closed  bool
+}
+
+func newHBONEStreamConn(body io.ReadCloser, w http.ResponseWriter, flusher http.Flusher, remoteAddr string, localAddr net.Addr) *hboneStreamConn {
+	var rAddr net.Addr = hboneAddr{addr: remoteAddr}
+	if parsed, err := net.ResolveTCPAddr("tcp", remoteAddr); err == nil {
+		rAddr = parsed
+	}
+	if localAddr == nil {
+		localAddr = hboneAddr{addr: "hbone-server"}
+	}
+	return &hboneStreamConn{
+		reader:     newDeadlineReader(body),
+		w:          w,
+		flusher:    flusher,
+		remoteAddr: rAddr,
+		localAddr:  localAddr,
+	}
+}
+
+func (c *hboneStreamConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *hboneStreamConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	n, err := c.w.Write(p)
+	if c.flusher != nil {
+		c.flusher.Flush()
+	}
+	return n, err
+}
+
+func (c *hboneStreamConn) Close() error {
+	c.writeMu.Lock()
+	alreadyClosed := c.closed
+	c.closed = true
+	c.writeMu.Unlock()
+	if alreadyClosed {
+		return nil
+	}
+	return c.reader.Close()
+}
+
+func (c *hboneStreamConn) LocalAddr() net.Addr               { return c.localAddr }
+func (c *hboneStreamConn) RemoteAddr() net.Addr              { return c.remoteAddr }
+func (c *hboneStreamConn) SetDeadline(t time.Time) error     { return c.reader.SetReadDeadline(t) }
+func (c *hboneStreamConn) SetReadDeadline(t time.Time) error { return c.reader.SetReadDeadline(t) }
+func (c *hboneStreamConn) SetWriteDeadline(time.Time) error  { return nil }
