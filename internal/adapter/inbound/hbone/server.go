@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ type Server struct {
 	cfgMu        sync.RWMutex
 	nodeID       string
 	httpBridge   inbound.HTTPStreamBridge
+	authorizer   inbound.Authorizer
 }
 
 // NewServer creates a new HBONE server listening on the specified address.
@@ -149,6 +151,13 @@ func (s *Server) SetHTTPBridge(bridge inbound.HTTPStreamBridge) {
 	s.httpBridge = bridge
 }
 
+// SetAuthorizer configures an inbound Authorizer evaluated at L4 connection establishment.
+func (s *Server) SetAuthorizer(authorizer inbound.Authorizer) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.authorizer = authorizer
+}
+
 // SetTLSConfig updates the server's mTLS configuration.
 func (s *Server) SetTLSConfig(tlsConfig *tls.Config) {
 	if tlsConfig != nil {
@@ -234,14 +243,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var callerIdentity string
 	callerVerified := false
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-		peerCert := r.TLS.PeerCertificates[0]
-		if len(peerCert.URIs) > 0 {
-			callerIdentity = peerCert.URIs[0].String()
+	if r.TLS != nil {
+		for _, peerCert := range r.TLS.PeerCertificates {
+			for _, uri := range peerCert.URIs {
+				if uri.Scheme == "spiffe" {
+					callerIdentity = uri.String()
+					callerVerified = callerIdentity != ""
+					break
+				}
+			}
+			if callerIdentity != "" {
+				break
+			}
+		}
+		if callerIdentity == "" && len(r.TLS.PeerCertificates) > 0 && len(r.TLS.PeerCertificates[0].URIs) > 0 {
+			callerIdentity = r.TLS.PeerCertificates[0].URIs[0].String()
 			callerVerified = callerIdentity != ""
 		}
-	}
-	if callerIdentity == "" {
+	} else {
 		callerIdentity = r.Header.Get(HeaderCallerIdentity)
 		if callerIdentity == "" {
 			callerIdentity = r.Header.Get(HeaderSourceIdentity)
@@ -250,6 +269,63 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if callerIdentity != "" {
 		log.Printf("Proxy HBONE server accepted connection for %s (nodeServiceID=%q, realDest=%q) from caller %s\n",
 			destAddr, nodeServiceID, realDest, callerIdentity)
+	}
+
+	s.cfgMu.RLock()
+	httpBridge := s.httpBridge
+	nodeID := s.nodeID
+	authorizer := s.authorizer
+	s.cfgMu.RUnlock()
+
+	destMeshIP, destPort := parseHostPort(realDest)
+	if destPort == 0 && resolvedSvc.Port > 0 {
+		destPort = resolvedSvc.Port
+	}
+	if destPort == 0 {
+		_, destPort = parseHostPort(destAddr)
+	}
+
+	inboundL7Available := false
+	if l7Checker, ok := httpBridge.(interface{ InboundL7Enabled() bool }); ok {
+		inboundL7Available = l7Checker.InboundL7Enabled()
+	} else if httpBridge != nil {
+		inboundL7Available = true
+	}
+
+	authzRequiresL7 := false
+	resolvedNS := resolvedSvc.Namespace
+	resolvedName := resolvedSvc.Name
+	resolvedProto := resolvedSvc.Protocol
+	if authorizer != nil {
+		decision := authorizer.AuthorizeConnection(r.Context(), model.AuthzRequest{
+			Layer:              model.AuthzLayerL4,
+			CallerIdentity:     callerIdentity,
+			CallerVerified:     callerVerified,
+			SourceNodeID:       sourceNodeID,
+			SourceAddr:         r.RemoteAddr,
+			DestNamespace:      resolvedSvc.Namespace,
+			DestServiceName:    resolvedSvc.Name,
+			DestNodeServiceID:  nodeServiceID,
+			DestMeshIP:         destMeshIP,
+			DestPort:           destPort,
+			DestProtocol:       resolvedSvc.Protocol,
+			DestLabels:         resolvedSvc.Labels,
+			InboundL7Available: inboundL7Available,
+		})
+		if !decision.Allowed {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		authzRequiresL7 = decision.RequiresL7
+		if resolvedNS == "" {
+			resolvedNS = decision.ResolvedDestNamespace
+		}
+		if resolvedName == "" {
+			resolvedName = decision.ResolvedDestServiceName
+		}
+		if resolvedProto == "" {
+			resolvedProto = decision.ResolvedProtocol
+		}
 	}
 
 	// Dial target real destination. The socket is marked so Linux redirect rules
@@ -269,11 +345,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	s.cfgMu.RLock()
-	httpBridge := s.httpBridge
-	nodeID := s.nodeID
-	s.cfgMu.RUnlock()
-
 	if httpBridge != nil {
 		var localAddr net.Addr
 		if s.listener != nil {
@@ -288,17 +359,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		meta := model.ConnectionMeta{
 			Direction:       model.DirectionInbound,
-			ConfiguredProto: model.NormalizeProtocol(resolvedSvc.Protocol),
+			ConfiguredProto: model.NormalizeProtocol(resolvedProto),
+			RawProtocol:     resolvedProto,
 			SourceNodeID:    sourceNodeID,
 			DestNodeID:      nodeID,
 			CallerIdentity:  callerIdentity,
 			CallerVerified:  callerVerified,
 			SourceAddr:      r.RemoteAddr,
 			DestAddr:        destAddr,
-			Namespace:       resolvedSvc.Namespace,
-			ServiceName:     resolvedSvc.Name,
+			DestPort:        destPort,
+			Namespace:       resolvedNS,
+			ServiceName:     resolvedName,
 			NodeServiceID:   svcID,
 			ServiceLabels:   resolvedSvc.Labels,
+			AuthzRequiresL7: authzRequiresL7,
 		}
 		if err := httpBridge.Bridge(r.Context(), hboneConn, targetConn, meta); err != nil {
 			log.Printf("Inbound HTTP bridge error for %s: %v\n", destAddr, err)
@@ -404,3 +478,18 @@ func (c *hboneStreamConn) RemoteAddr() net.Addr              { return c.remoteAd
 func (c *hboneStreamConn) SetDeadline(t time.Time) error     { return c.reader.SetReadDeadline(t) }
 func (c *hboneStreamConn) SetReadDeadline(t time.Time) error { return c.reader.SetReadDeadline(t) }
 func (c *hboneStreamConn) SetWriteDeadline(time.Time) error  { return nil }
+
+func parseHostPort(addr string) (string, int) {
+	if addr == "" {
+		return "", 0
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, 0
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return host, 0
+	}
+	return host, port
+}

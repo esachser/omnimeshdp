@@ -53,6 +53,11 @@ var (
 	// HTTP L7 inspection/injection errors per spec/http-headers.md
 	ErrInvalidHTTPConfig = errors.New("invalid HTTP L7 configuration")
 	ErrInvalidHeader     = errors.New("invalid HTTP header")
+
+	// Authorization errors per spec/authorization.md
+	ErrForbidden          = errors.New("access denied by authorization policy (403 Forbidden)")
+	ErrInvalidAuthzConfig = errors.New("invalid authorization configuration")
+	ErrUnauthorized       = errors.New("caller identity is missing or unverified")
 )
 
 // HTTPRejectError may be returned by an HTTP request interceptor to reject a request
@@ -61,6 +66,8 @@ type HTTPRejectError struct {
 	StatusCode int
 	Message    string
 	Headers    http.Header
+	Trailers   http.Header
+	OmitBody   bool
 }
 
 // Error implements the error interface.
@@ -86,12 +93,15 @@ func (e *TunnelStatusError) Error() string {
 	return fmt.Sprintf("%s: status %d", ErrTunnelFailed.Error(), e.StatusCode)
 }
 
-// Is allows matching against ErrTunnelFailed and, for HTTP 502, ErrBadGateway.
+// Is allows matching against ErrTunnelFailed, ErrBadGateway (HTTP 502), and ErrForbidden (HTTP 403).
 func (e *TunnelStatusError) Is(target error) bool {
 	if target == ErrTunnelFailed {
 		return true
 	}
 	if e.StatusCode == http.StatusBadGateway && target == ErrBadGateway {
+		return true
+	}
+	if e.StatusCode == http.StatusForbidden && target == ErrForbidden {
 		return true
 	}
 	return false

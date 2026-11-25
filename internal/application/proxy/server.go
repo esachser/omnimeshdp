@@ -53,6 +53,11 @@ func (s *ServerSideService) SetHTTPBridge(bridge inbound.HTTPStreamBridge) {
 	s.server.SetHTTPBridge(bridge)
 }
 
+// SetAuthorizer configures an inbound Authorizer evaluated on incoming HBONE connections.
+func (s *ServerSideService) SetAuthorizer(authorizer inbound.Authorizer) {
+	s.server.SetAuthorizer(authorizer)
+}
+
 // Start runs the HBONE server until context cancellation.
 func (s *ServerSideService) Start(ctx context.Context) error {
 	return s.server.Start(ctx)

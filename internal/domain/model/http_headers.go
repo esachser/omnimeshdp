@@ -66,16 +66,19 @@ type ConnectionMeta struct {
 	Direction       TrafficDirection
 	ConfiguredProto HTTPProtocol
 	DetectedProto   HTTPProtocol
+	RawProtocol     string
 	SourceNodeID    string
 	DestNodeID      string
 	CallerIdentity  string
 	CallerVerified  bool
 	SourceAddr      string
 	DestAddr        string
+	DestPort        int
 	Namespace       string
 	ServiceName     string
 	NodeServiceID   string
 	ServiceLabels   map[string]string
+	AuthzRequiresL7 bool
 }
 
 // TraceContext stores parsed W3C Trace Context fields for a single HTTP request.

@@ -9,6 +9,7 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,11 +17,13 @@ import (
 	adaptergrpc "github.com/esachser/omnimeshdp/internal/adapter/outbound/grpc"
 	"github.com/esachser/omnimeshdp/internal/adapter/outbound/spiffe"
 	"github.com/esachser/omnimeshdp/internal/application/agent"
+	"github.com/esachser/omnimeshdp/internal/application/authz"
 	"github.com/esachser/omnimeshdp/internal/application/httpproxy"
 	"github.com/esachser/omnimeshdp/internal/application/proxy"
 	"github.com/esachser/omnimeshdp/internal/application/service"
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
+	"github.com/esachser/omnimeshdp/internal/port/inbound"
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 )
@@ -54,6 +57,7 @@ type Orchestrator struct {
 	listenerOpener   ListenerOpener
 	retryInterval    time.Duration
 	httpInterceptors []outbound.HeaderInterceptor
+	authzObserver    inbound.AuthzDecisionObserver
 
 	// Internal state across steps
 	runCtx             context.Context
@@ -69,6 +73,7 @@ type Orchestrator struct {
 	controlPlaneClient outbound.ControlPlaneClient
 	controlPlaneAgent  *agent.ControlPlaneAgent
 	router             *proxy.Router
+	authzEngine        *authz.Engine
 	packetProcessor    outbound.PacketProcessor
 	processorCancel    context.CancelFunc
 	processorDone      chan struct{}
@@ -149,6 +154,13 @@ func WithRetryInterval(interval time.Duration) Option {
 func WithHTTPInterceptors(interceptors ...outbound.HeaderInterceptor) Option {
 	return func(o *Orchestrator) {
 		o.httpInterceptors = append(o.httpInterceptors, interceptors...)
+	}
+}
+
+// WithAuthzObserver attaches an AuthzDecisionObserver to the data plane authorization engine.
+func WithAuthzObserver(observer inbound.AuthzDecisionObserver) Option {
+	return func(o *Orchestrator) {
+		o.authzObserver = observer
 	}
 }
 
@@ -291,11 +303,25 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	o.serverSideService = proxy.NewServerSideService(o.config.Listeners.ExternalAddr, serverTLS)
 	o.serverSideService.SetNodeID(o.config.ControlPlane.NodeID)
 
+	authzEngine, err := o.buildAuthzEngine()
+	if err != nil {
+		_ = intLn.Close()
+		_ = extLn.Close()
+		return fmt.Errorf("%w: %w", domain.ErrConfigLoadFailed, err)
+	}
+	o.mu.Lock()
+	o.authzEngine = authzEngine
+	o.mu.Unlock()
+	o.serverSideService.SetAuthorizer(authzEngine)
+
 	if httpBridge, err := o.buildHTTPBridge(); err != nil {
 		_ = intLn.Close()
 		_ = extLn.Close()
 		return fmt.Errorf("%w: %w", domain.ErrConfigLoadFailed, err)
 	} else if httpBridge != nil {
+		if o.config.Authorization.EnforceL7 && o.config.Authorization.NormalizedMode() != model.AuthzModeDisabled {
+			httpBridge.SetAuthorizer(authzEngine)
+		}
 		o.clientSideService.SetHTTPBridge(httpBridge)
 		o.serverSideService.SetHTTPBridge(httpBridge)
 	}
@@ -344,13 +370,19 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		return fmt.Errorf("%w: %v", domain.ErrInitialScopeSnapshotFailed, err)
 	}
 	o.router.ApplySnapshot(snapshot)
-	log.Printf("[Step 5/10] ScopeSnapshot processed: %d services, %d routes, %d namespaces.\n",
-		len(snapshot.Services), len(snapshot.Routes), len(snapshot.Namespaces))
+	if o.authzEngine != nil {
+		o.authzEngine.ApplySnapshot(snapshot)
+	}
+	log.Printf("[Step 5/10] ScopeSnapshot processed: %d services, %d routes, %d authz policies, %d namespaces.\n",
+		len(snapshot.Services), len(snapshot.Routes), len(snapshot.AuthzPolicies), len(snapshot.Namespaces))
 
 	o.controlPlaneAgent.SetSnapshotHandler(func(newSnapshot *omnimeshv1.ScopeSnapshot) {
-		log.Printf("Router: applying updated ScopeSnapshot received upon reconnect (%d services, %d routes, %d namespaces)\n",
-			len(newSnapshot.Services), len(newSnapshot.Routes), len(newSnapshot.Namespaces))
+		log.Printf("Router: applying updated ScopeSnapshot received upon reconnect (%d services, %d routes, %d authz policies, %d namespaces)\n",
+			len(newSnapshot.Services), len(newSnapshot.Routes), len(newSnapshot.AuthzPolicies), len(newSnapshot.Namespaces))
 		o.router.ApplySnapshot(newSnapshot)
+		if o.authzEngine != nil {
+			o.authzEngine.ApplySnapshot(newSnapshot)
+		}
 		if err := o.syncPacketProcessorSubnets(o.router.Subnets()); err != nil {
 			log.Printf("Failed to update packet processor subnets from ScopeSnapshot: %v\n", err)
 		}
@@ -435,6 +467,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		defer o.wg.Done()
 		err := o.controlPlaneAgent.StreamUpdates(ctx, func(update *omnimeshv1.ScopeUpdate) {
 			o.router.ApplyUpdate(update)
+			if o.authzEngine != nil {
+				o.authzEngine.ApplyUpdate(update)
+			}
 			if len(update.Namespaces) > 0 {
 				if err := o.syncPacketProcessorSubnets(o.router.Subnets()); err != nil {
 					log.Printf("Failed to update packet processor subnets from ScopeUpdate: %v\n", err)
@@ -532,6 +567,13 @@ func (o *Orchestrator) Router() *proxy.Router {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.router
+}
+
+// AuthzEngine returns the data plane authorization engine used by the Orchestrator.
+func (o *Orchestrator) AuthzEngine() *authz.Engine {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.authzEngine
 }
 
 // Subnets returns a copy of the currently intercepted subnets.
@@ -766,4 +808,30 @@ func (o *Orchestrator) buildHTTPBridge() (*httpproxy.Bridge, error) {
 		return nil, nil
 	}
 	return httpproxy.NewBridge(httpCfg, o.config.Spire.Disabled, o.httpInterceptors...)
+}
+
+func (o *Orchestrator) buildAuthzEngine() (*authz.Engine, error) {
+	trustDomain := strings.TrimSpace(o.config.Authorization.TrustDomain)
+	if trustDomain == "" {
+		trustDomain = strings.TrimSpace(o.config.Spire.TrustDomain)
+	}
+	if trustDomain == "" {
+		if sp, ok := o.tlsProvider.(*spiffe.SpiffeTLSProvider); ok {
+			trustDomain = sp.ServerSVID().TrustDomain().String()
+		} else if parsed, ok := model.ParseSPIFFEIdentity(o.config.Spire.ServerSVID); ok {
+			trustDomain = parsed.TrustDomain
+		}
+	}
+
+	opts := []authz.EngineOption{
+		authz.WithAllowUnverifiedIdentity(o.config.Authorization.ShouldAllowUnverifiedIdentity(o.config.Spire.Disabled)),
+	}
+	if trustDomain != "" {
+		opts = append(opts, authz.WithTrustDomain(trustDomain))
+	}
+	if o.authzObserver != nil {
+		opts = append(opts, authz.WithObserver(o.authzObserver))
+	}
+
+	return authz.NewEngine(o.config.Authorization, opts...)
 }

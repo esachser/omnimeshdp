@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -649,4 +651,124 @@ func TestHBONEServer_EnforcesHTTP2ProtocolAndSetTLSConfig(t *testing.T) {
 			t.Fatalf("echo mismatch: got %q, want %q", string(buf), string(msg))
 		}
 	})
+}
+
+type recordingHBONEAuthorizer struct {
+	allowCaller string
+	calls       atomic.Int32
+	mu          sync.Mutex
+	lastReq     model.AuthzRequest
+}
+
+func (a *recordingHBONEAuthorizer) AuthorizeConnection(_ context.Context, req model.AuthzRequest) model.AuthzDecision {
+	a.calls.Add(1)
+	a.mu.Lock()
+	a.lastReq = req
+	a.mu.Unlock()
+	if req.CallerVerified && req.CallerIdentity == a.allowCaller {
+		return model.AuthzDecision{Allowed: true, Reason: model.AuthzReasonExplicitAllow}
+	}
+	return model.AuthzDecision{Allowed: false, Reason: model.AuthzReasonExplicitDeny}
+}
+
+func (a *recordingHBONEAuthorizer) lastRequest() model.AuthzRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastReq
+}
+
+func (a *recordingHBONEAuthorizer) AuthorizeHTTP(_ context.Context, req model.AuthzRequest) model.AuthzDecision {
+	return model.AuthzDecision{Allowed: req.CallerVerified && req.CallerIdentity == a.allowCaller}
+}
+
+func TestHBONEServer_AuthorizerDeniesBeforeDialAndPreventsHeaderSpoofing(t *testing.T) {
+	td := spiffeid.RequireTrustDomainFromString("omnimesh.local")
+	caCert, caKey, bundle := createTestCA(t)
+
+	serverSVID := createTestSPIFFEWorkloadSVID(t, caCert, caKey, "spiffe://omnimesh.local/ns/omnimesh-system/sa/node-b")
+	authorizedSVID := createTestSPIFFEWorkloadSVID(t, caCert, caKey, "spiffe://omnimesh.local/ns/prod/sa/orders")
+	attackerSVID := createTestSPIFFEWorkloadSVID(t, caCert, caKey, "spiffe://omnimesh.local/ns/prod/sa/attacker")
+
+	serverTLS := tlsconfig.MTLSServerConfig(serverSVID, bundle, tlsconfig.AuthorizeMemberOf(td))
+	authorizedTLS := tlsconfig.MTLSClientConfig(authorizedSVID, bundle, tlsconfig.AuthorizeMemberOf(td))
+	attackerTLS := tlsconfig.MTLSClientConfig(attackerSVID, bundle, tlsconfig.AuthorizeMemberOf(td))
+
+	var backendAccepts atomic.Int32
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen backend: %v", err)
+	}
+	defer backendLn.Close()
+	go func() {
+		for {
+			c, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			backendAccepts.Add(1)
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+	backendPort := backendLn.Addr().(*net.TCPAddr).Port
+
+	hbLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen hbone: %v", err)
+	}
+	hbAddr := hbLn.Addr().String()
+
+	authzStub := &recordingHBONEAuthorizer{allowCaller: authorizedSVID.ID.String()}
+	srv := hbone.NewServer(hbAddr, serverTLS)
+	srv.SetServices([]model.NodeServiceInfo{
+		{Namespace: "prod", Name: "payments", ID: "payments-1", Host: "127.0.0.1", Port: backendPort},
+	})
+	srv.SetAuthorizer(authzStub)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx, hbLn) }()
+
+	client := hbone.NewClient()
+
+	// 1. Attacker presents attackerSVID over mTLS while spoofing x-omnimesh-caller-identity
+	//    of authorizedSVID in the HTTP/2 CONNECT header. Must be denied AND never dial backend.
+	_, err = client.OpenTunnelWithOptions(ctx, hbone.TunnelOptions{
+		ConnectTimeout: 2 * time.Second,
+		TargetHost:     hbAddr,
+		RealDest:       "10.0.0.5:8080",
+		NodeServiceID:  "payments-1",
+		Identity:       authorizedSVID.ID.String(), // Spoofed header value!
+		TLSConfig:      attackerTLS,                // Real mTLS cert is attackerSVID!
+	})
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("expected ErrForbidden for spoofed attacker, got %v", err)
+	}
+	lastReq := authzStub.lastRequest()
+	if lastReq.CallerIdentity != attackerSVID.ID.String() || !lastReq.CallerVerified {
+		t.Fatalf("expected mTLS identity %q (verified=true), got %q (verified=%v)",
+			attackerSVID.ID.String(), lastReq.CallerIdentity, lastReq.CallerVerified)
+	}
+	if backendAccepts.Load() != 0 {
+		t.Fatalf("expected target backend never to be dialed on authz deny, got %d accepts", backendAccepts.Load())
+	}
+
+	// 2. Authorized SVID succeeds and dials backend.
+	tun, err := client.OpenTunnelWithOptions(ctx, hbone.TunnelOptions{
+		ConnectTimeout: 2 * time.Second,
+		TargetHost:     hbAddr,
+		RealDest:       "10.0.0.5:8080",
+		NodeServiceID:  "payments-1",
+		Identity:       authorizedSVID.ID.String(),
+		TLSConfig:      authorizedTLS,
+	})
+	if err != nil {
+		t.Fatalf("expected authorized tunnel to succeed, got %v", err)
+	}
+	_ = tun.Close()
+	if backendAccepts.Load() != 1 {
+		t.Fatalf("expected 1 backend accept for authorized connection, got %d", backendAccepts.Load())
+	}
 }
