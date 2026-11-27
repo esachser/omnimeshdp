@@ -250,6 +250,17 @@ func (s *ClientSideService) singleTunnel(
 	})
 	if err != nil {
 		log.Printf("Tunnel error: %v\n", err)
+		if errors.Is(err, domain.ErrForbidden) {
+			respondForbiddenOutbound(ctx, httpBridge, localConn, model.ConnectionMeta{
+				Direction:      model.DirectionOutbound,
+				SourceNodeID:   sourceNodeID,
+				CallerIdentity: identity,
+				CallerVerified: clientTLS != nil && identity != "",
+				SourceAddr:     localConn.RemoteAddr().String(),
+				DestAddr:       realDest,
+				NodeServiceID:  nodeServiceID,
+			})
+		}
 		return
 	}
 	if err := bridgeOutboundTunnel(ctx, httpBridge, tunnel, localConn, model.ConnectionMeta{
@@ -333,6 +344,7 @@ func (s *ClientSideService) tunnelWithRetries(
 			meta := model.ConnectionMeta{
 				Direction:       model.DirectionOutbound,
 				ConfiguredProto: model.NormalizeProtocol(resolved.Protocol),
+				RawProtocol:     resolved.Protocol,
 				SourceNodeID:    sourceNodeID,
 				DestNodeID:      resolved.NodeID,
 				CallerIdentity:  identity,
@@ -356,6 +368,22 @@ func (s *ClientSideService) tunnelWithRetries(
 		if !isRetryableRouteError(ctx, err, retryCfg) {
 			log.Printf("Non-retryable HBONE tunnel error to %s (destination %s, nodeServiceID %q): %v\n",
 				resolved.TargetHost, resolved.RealDest, resolved.ServiceID, err)
+			if errors.Is(err, domain.ErrForbidden) {
+				respondForbiddenOutbound(ctx, httpBridge, localConn, model.ConnectionMeta{
+					Direction:       model.DirectionOutbound,
+					ConfiguredProto: model.NormalizeProtocol(resolved.Protocol),
+					RawProtocol:     resolved.Protocol,
+					SourceNodeID:    sourceNodeID,
+					DestNodeID:      resolved.NodeID,
+					CallerIdentity:  identity,
+					CallerVerified:  clientTLS != nil && identity != "",
+					SourceAddr:      localConn.RemoteAddr().String(),
+					DestAddr:        resolved.RealDest,
+					Namespace:       resolved.Namespace,
+					ServiceName:     resolved.ServiceName,
+					NodeServiceID:   resolved.ServiceID,
+				})
+			}
 			return err
 		}
 
@@ -395,6 +423,20 @@ func bridgeOutboundTunnel(
 		return httpBridge.Bridge(ctx, localConn, tunnel.Conn(), meta)
 	}
 	return tunnel.Bridge(localConn)
+}
+
+func respondForbiddenOutbound(
+	ctx context.Context,
+	httpBridge inbound.HTTPStreamBridge,
+	localConn net.Conn,
+	meta model.ConnectionMeta,
+) {
+	if httpBridge == nil || localConn == nil {
+		return
+	}
+	if responder, ok := httpBridge.(inbound.HTTPForbiddenResponder); ok {
+		_ = responder.RespondForbidden(ctx, localConn, meta)
+	}
 }
 
 func isRetryableRouteError(ctx context.Context, err error, cfg model.RetryConfig) bool {

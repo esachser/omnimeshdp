@@ -34,6 +34,9 @@ func TestDefaultConfig(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("default config should be valid: %v", err)
 	}
+	if cfg.Authorization.Mode != "strict" || cfg.Authorization.NamespaceDefaultIsolation != "strict" || !cfg.Authorization.EnforceL7 {
+		t.Fatalf("unexpected default authorization config: %+v", cfg.Authorization)
+	}
 	if !cfg.HTTP.Enabled || !cfg.HTTP.Outbound.Enabled || !cfg.HTTP.Inbound.Enabled {
 		t.Fatalf("expected HTTP L7 outbound and inbound to be enabled by default")
 	}
@@ -353,5 +356,69 @@ func TestConfigDirFiles(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("expected %s to be valid, got: %v", filepath.Base(relPath), err)
 		}
+	}
+}
+
+func TestAuthorizationConfigFileAndEnvOverrides(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "config.json")
+	configJSON := `{
+		"spire": {"disabled": true},
+		"authorization": {
+			"mode": "dry_run",
+			"namespace_default_isolation": "open",
+			"allow_unverified_identity": false,
+			"enforce_l7": true,
+			"trust_domain": "omnimesh.local",
+			"audit_log_allows": true,
+			"local_policies": [
+				{
+					"name": "local-allow",
+					"namespace": "prod",
+					"action": "allow",
+					"source": {"namespace": "prod", "name": "web"},
+					"destination": {"namespace": "prod", "name": "api"},
+					"ports": [8080]
+				}
+			]
+		}
+	}`
+	if err := os.WriteFile(configFile, []byte(configJSON), 0644); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	cfg, err := model.LoadConfig(configFile)
+	if err != nil {
+		t.Fatalf("LoadConfig error: %v", err)
+	}
+	if cfg.Authorization.Mode != "dry_run" || cfg.Authorization.NamespaceDefaultIsolation != "open" ||
+		cfg.Authorization.ShouldAllowUnverifiedIdentity(cfg.Spire.Disabled) ||
+		!cfg.Authorization.AuditLogAllows || len(cfg.Authorization.LocalPolicies) != 1 {
+		t.Fatalf("unexpected Authorization config parsed from file: %+v", cfg.Authorization)
+	}
+
+	t.Setenv("AUTHZ_MODE", "permissive")
+	t.Setenv("AUTHZ_NAMESPACE_DEFAULT_ISOLATION", "strict")
+	t.Setenv("AUTHZ_ALLOW_UNVERIFIED_IDENTITY", "true")
+	t.Setenv("AUTHZ_ENFORCE_L7", "false")
+	t.Setenv("AUTHZ_TRUST_DOMAIN", "corp.mesh")
+	t.Setenv("AUTHZ_AUDIT_LOG_ALLOWS", "false")
+
+	cfgEnv, err := model.LoadConfig(configFile)
+	if err != nil {
+		t.Fatalf("LoadConfig with env overrides error: %v", err)
+	}
+	if cfgEnv.Authorization.Mode != "permissive" ||
+		cfgEnv.Authorization.NamespaceDefaultIsolation != "strict" ||
+		!cfgEnv.Authorization.ShouldAllowUnverifiedIdentity(false) ||
+		cfgEnv.Authorization.EnforceL7 ||
+		cfgEnv.Authorization.TrustDomain != "corp.mesh" ||
+		cfgEnv.Authorization.AuditLogAllows {
+		t.Fatalf("unexpected Authorization config after env overrides: %+v", cfgEnv.Authorization)
+	}
+
+	t.Setenv("AUTHZ_MODE", "invalid-mode")
+	if _, err := model.LoadConfig(configFile); err == nil {
+		t.Fatalf("expected validation error for invalid AUTHZ_MODE")
 	}
 }

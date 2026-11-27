@@ -11,15 +11,16 @@ import (
 
 // AppConfig represents the complete configuration for OmnimeshDP.
 type AppConfig struct {
-	Spire        SpireConfig        `json:"spire"`
-	Listeners    ListenersConfig    `json:"listeners"`
-	ControlPlane ControlPlaneConfig `json:"control_plane"`
-	Interception InterceptionConfig `json:"interception"`
-	Routing      RoutingConfig      `json:"routing"`
-	HTTP         HTTPConfig         `json:"http"`
-	Services     []NodeServiceInfo  `json:"services"`
-	ServicesFile string             `json:"services_file"`
-	ServicesDir  string             `json:"services_dir"`
+	Spire         SpireConfig         `json:"spire"`
+	Listeners     ListenersConfig     `json:"listeners"`
+	ControlPlane  ControlPlaneConfig  `json:"control_plane"`
+	Interception  InterceptionConfig  `json:"interception"`
+	Routing       RoutingConfig       `json:"routing"`
+	HTTP          HTTPConfig          `json:"http"`
+	Authorization AuthorizationConfig `json:"authorization"`
+	Services      []NodeServiceInfo   `json:"services"`
+	ServicesFile  string              `json:"services_file"`
+	ServicesDir   string              `json:"services_dir"`
 }
 
 // SpireConfig holds configuration for the SPIFFE/SPIRE workload API agent.
@@ -72,10 +73,11 @@ func DefaultConfig() *AppConfig {
 		Interception: InterceptionConfig{
 			Type: "wfp",
 		},
-		Routing:     DefaultRoutingConfig(),
-		HTTP:        DefaultHTTPConfig(),
-		Services:    make([]NodeServiceInfo, 0),
-		ServicesDir: "./services.d/",
+		Routing:       DefaultRoutingConfig(),
+		HTTP:          DefaultHTTPConfig(),
+		Authorization: DefaultAuthorizationConfig(),
+		Services:      make([]NodeServiceInfo, 0),
+		ServicesDir:   "./services.d/",
 	}
 }
 
@@ -164,6 +166,7 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 	if err := applyHTTPEnvOverrides(&cfg.HTTP); err != nil {
 		return nil, err
 	}
+	applyAuthzEnvOverrides(&cfg.Authorization)
 
 	// 3. Read services file if specified
 	if cfg.ServicesFile != "" {
@@ -204,6 +207,9 @@ func (c *AppConfig) Validate() error {
 	}
 	if err := c.HTTP.Validate(); err != nil {
 		return fmt.Errorf("invalid HTTP configuration: %w", err)
+	}
+	if err := c.Authorization.Validate(); err != nil {
+		return fmt.Errorf("invalid authorization configuration: %w", err)
 	}
 	return nil
 }
@@ -260,4 +266,16 @@ func applyHTTPEnvOverrides(httpCfg *HTTPConfig) error {
 
 	applyEnvBool("HTTP_MESH_HEADERS_ENABLED", &httpCfg.MeshHeaders.Enabled)
 	return nil
+}
+
+func applyAuthzEnvOverrides(authzCfg *AuthorizationConfig) {
+	applyEnvString("AUTHZ_MODE", &authzCfg.Mode)
+	applyEnvString("AUTHZ_NAMESPACE_DEFAULT_ISOLATION", &authzCfg.NamespaceDefaultIsolation)
+	if val, ok := os.LookupEnv("AUTHZ_ALLOW_UNVERIFIED_IDENTITY"); ok && strings.TrimSpace(val) != "" {
+		parsed := parseBoolValue(val)
+		authzCfg.AllowUnverifiedIdentity = &parsed
+	}
+	applyEnvBool("AUTHZ_ENFORCE_L7", &authzCfg.EnforceL7)
+	applyEnvString("AUTHZ_TRUST_DOMAIN", &authzCfg.TrustDomain)
+	applyEnvBool("AUTHZ_AUDIT_LOG_ALLOWS", &authzCfg.AuditLogAllows)
 }

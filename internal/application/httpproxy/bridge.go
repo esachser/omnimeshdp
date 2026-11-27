@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,10 @@ import (
 	"github.com/esachser/omnimeshdp/internal/port/outbound"
 )
 
-var _ inbound.HTTPStreamBridge = (*Bridge)(nil)
+var (
+	_ inbound.HTTPStreamBridge       = (*Bridge)(nil)
+	_ inbound.HTTPForbiddenResponder = (*Bridge)(nil)
+)
 
 type exchangeKey struct{}
 
@@ -42,6 +46,8 @@ type Bridge struct {
 
 	meshSanitizer *MeshMetadataInterceptor
 	trace         *TraceContextInterceptor
+	authzMu       sync.RWMutex
+	authz         *AuthzInterceptor
 	meshInjector  *MeshMetadataInterceptor
 	rules         *RuleEngineInterceptor
 	custom        []outbound.HeaderInterceptor
@@ -95,6 +101,22 @@ func NewBridge(cfg model.HTTPConfig, spireDisabled bool, customInterceptors ...o
 	return b, nil
 }
 
+// SetAuthorizer configures the inbound L7 Authorizer enforced by the HTTP/1.1 and HTTP/2 request pipeline.
+func (b *Bridge) SetAuthorizer(authorizer inbound.Authorizer) {
+	b.authzMu.Lock()
+	defer b.authzMu.Unlock()
+	if authorizer == nil {
+		b.authz = nil
+		return
+	}
+	b.authz = NewAuthzInterceptor(authorizer)
+}
+
+// InboundL7Enabled reports whether L7 HTTP inspection is currently enabled for inbound connections.
+func (b *Bridge) InboundL7Enabled() bool {
+	return b.isDirectionEnabled(model.DirectionInbound)
+}
+
 func (b *Bridge) isDirectionEnabled(dir model.TrafficDirection) bool {
 	if !b.cfg.Enabled {
 		return false
@@ -117,6 +139,11 @@ func (b *Bridge) Bridge(ctx context.Context, downstream net.Conn, upstream net.C
 
 	if !b.isDirectionEnabled(meta.Direction) || meta.ConfiguredProto == model.ProtocolTCP {
 		meta.DetectedProto = model.ProtocolTCP
+		if meta.AuthzRequiresL7 {
+			log.Printf("[Authz] event=authz.denied layer=l7 reason=l7_required caller=%q dest_service=%s/%s node_service_id=%q\n",
+				meta.CallerIdentity, meta.Namespace, meta.ServiceName, meta.NodeServiceID)
+			return domain.ErrForbidden
+		}
 		return b.bridgeL4(ctx, downstream, upstream)
 	}
 
@@ -142,6 +169,11 @@ func (b *Bridge) Bridge(ctx context.Context, downstream net.Conn, upstream net.C
 	case model.ProtocolHTTP2:
 		return b.proxyHTTP2(ctx, targetConn, upstream, meta)
 	default:
+		if meta.AuthzRequiresL7 {
+			log.Printf("[Authz] event=authz.denied layer=l7 reason=l7_required caller=%q dest_service=%s/%s node_service_id=%q\n",
+				meta.CallerIdentity, meta.Namespace, meta.ServiceName, meta.NodeServiceID)
+			return domain.ErrForbidden
+		}
 		return b.bridgeL4(ctx, targetConn, upstream)
 	}
 }
@@ -322,14 +354,17 @@ func (b *Bridge) handleProxyError(rw http.ResponseWriter, req *http.Request, err
 		if req.ProtoMajor == 1 {
 			rw.Header().Set("Connection", "close")
 		}
-		if ex.rejected.Message != "" && rw.Header().Get("Content-Type") == "" {
+		if ex.rejected.Message != "" && !ex.rejected.OmitBody && rw.Header().Get("Content-Type") == "" {
 			rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		}
 		rw.WriteHeader(status)
-		if ex.rejected.Message != "" {
+		if ex.rejected.Message != "" && !ex.rejected.OmitBody {
 			_, _ = io.WriteString(rw, ex.rejected.Message)
 		}
-		ex.respCtx = &model.HTTPResponseContext{StatusCode: status, Headers: rw.Header()}
+		for k, vals := range ex.rejected.Trailers {
+			rw.Header()[http.TrailerPrefix+k] = slices.Clone(vals)
+		}
+		ex.respCtx = &model.HTTPResponseContext{StatusCode: status, Headers: rw.Header(), Trailers: ex.rejected.Trailers}
 		return
 	}
 
@@ -356,6 +391,14 @@ func (b *Bridge) runRequestPipeline(ctx context.Context, conn *model.ConnectionM
 	}
 	if b.trace != nil {
 		if err := b.trace.OnRequest(ctx, conn, req); err != nil {
+			return err
+		}
+	}
+	b.authzMu.RLock()
+	authzIc := b.authz
+	b.authzMu.RUnlock()
+	if authzIc != nil {
+		if err := authzIc.OnRequest(ctx, conn, req); err != nil {
 			return err
 		}
 	}
@@ -540,4 +583,107 @@ func (p *copyBufferPool) Put(b []byte) {
 		b = b[:p.size]
 		p.pool.Put(&b)
 	}
+}
+
+// RespondForbidden writes a protocol-appropriate access denied response (HTTP 403 or gRPC
+// PERMISSION_DENIED) directly to downstream when an outbound HBONE CONNECT receives HTTP 403.
+func (b *Bridge) RespondForbidden(ctx context.Context, downstream net.Conn, meta model.ConnectionMeta) error {
+	if downstream == nil {
+		return nil
+	}
+	defer downstream.Close()
+
+	if !b.isDirectionEnabled(model.DirectionOutbound) || meta.ConfiguredProto == model.ProtocolTCP {
+		return nil
+	}
+
+	var targetConn net.Conn = downstream
+	proto := meta.ConfiguredProto
+	if proto != model.ProtocolHTTP1 && proto != model.ProtocolHTTP2 {
+		peek := NewPeekableConn(downstream)
+		proto = peek.Sniff(ctx, b.sniffTimeout, b.cfg.MaxSniffBytes)
+		targetConn = peek
+	}
+
+	switch proto {
+	case model.ProtocolHTTP1:
+		return b.serveSingleForbidden(ctx, targetConn, false, meta)
+	case model.ProtocolHTTP2:
+		return b.serveSingleForbidden(ctx, targetConn, true, meta)
+	default:
+		return nil
+	}
+}
+
+func (b *Bridge) serveSingleForbidden(ctx context.Context, downstream net.Conn, isH2 bool, meta model.ConnectionMeta) error {
+	respCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	var protos http.Protocols
+	if isH2 {
+		protos.SetUnencryptedHTTP2(true)
+	} else {
+		protos.SetHTTP1(true)
+	}
+
+	ln := newSingleConnListener(respCtx, downstream)
+	defer ln.Close()
+
+	var once sync.Once
+	var srv *http.Server
+	var shutdownTimer atomic.Pointer[time.Timer]
+	srv = &http.Server{
+		MaxHeaderBytes: b.cfg.MaxHeaderBytes,
+		Protocols:      &protos,
+		BaseContext: func(net.Listener) context.Context {
+			return respCtx
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isH2 && (isGRPCContentType(r.Header.Get("Content-Type")) || strings.EqualFold(meta.RawProtocol, "grpc")) {
+				w.Header().Set("Content-Type", "application/grpc")
+				w.WriteHeader(http.StatusOK)
+				w.Header()[http.TrailerPrefix+"Grpc-Status"] = []string{"7"}
+				w.Header()[http.TrailerPrefix+"Grpc-Message"] = []string{"permission denied"}
+			} else {
+				if !isH2 {
+					w.Header().Set("Connection", "close")
+				}
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, "Forbidden\n")
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+			once.Do(func() {
+				delay := 10 * time.Millisecond
+				if isH2 {
+					delay = 50 * time.Millisecond
+				}
+				shutdownTimer.Store(time.AfterFunc(delay, func() {
+					_ = srv.Shutdown(respCtx)
+				}))
+			})
+		}),
+	}
+	defer func() {
+		if t := shutdownTimer.Load(); t != nil {
+			t.Stop()
+		}
+	}()
+	if isH2 {
+		srv.HTTP2 = &http.HTTP2Config{MaxReadFrameSize: 1 << 20}
+	}
+
+	stop := context.AfterFunc(respCtx, func() {
+		_ = srv.Close()
+		_ = ln.Close()
+	})
+	defer stop()
+
+	err := srv.Serve(ln)
+	if err != nil && (errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed)) {
+		return nil
+	}
+	return err
 }

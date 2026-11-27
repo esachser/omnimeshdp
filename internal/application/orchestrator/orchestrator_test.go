@@ -1156,3 +1156,220 @@ func TestOrchestrator_HTTPBridgeOptionAndValidation(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_AuthzConfigValidationAndLifecycleSync(t *testing.T) {
+	t.Run("fails fast on invalid Authorization config", func(t *testing.T) {
+		cfg := validTestConfig()
+		cfg.Spire.Disabled = true
+		cfg.Authorization.Mode = "invalid-mode"
+
+		orch := orchestrator.NewOrchestrator(
+			orchestrator.WithConfig(cfg),
+			orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+				return &mockControlPlaneClient{}
+			}),
+			orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+				return newMockListener(address), nil
+			}),
+		)
+
+		err := orch.Run(context.Background())
+		if !errors.Is(err, domain.ErrConfigLoadFailed) || !errors.Is(err, domain.ErrInvalidAuthzConfig) {
+			t.Fatalf("expected ErrInvalidAuthzConfig wrapped in ErrConfigLoadFailed, got: %v", err)
+		}
+	})
+
+	t.Run("syncs ScopeSnapshot and streaming ScopeUpdate to AuthzEngine", func(t *testing.T) {
+		updatesCh := make(chan *omnimeshv1.ScopeUpdate, 4)
+		mockCP := &mockControlPlaneClient{
+			updatesCh: updatesCh,
+			snapshotToReturn: &omnimeshv1.ScopeSnapshot{
+				Namespaces: []*omnimeshv1.NamespaceInfo{
+					{Name: "default", Cidr: "10.10.10.0/24", Subnets: []string{"10.10.10.0/24"}, Isolation: "strict"},
+				},
+				AuthzPolicies: []*omnimeshv1.AuthzPolicyInfo{
+					{
+						Name:        "initial-allow",
+						Namespace:   "default",
+						Action:      "ALLOW",
+						Source:      &omnimeshv1.SelectorInfo{Namespace: "default", Name: "client"},
+						Destination: &omnimeshv1.SelectorInfo{Namespace: "default", Name: "my-service"},
+					},
+				},
+			},
+		}
+
+		cfg := validTestConfig()
+		cfg.Spire.Disabled = false
+
+		orch := orchestrator.NewOrchestrator(
+			orchestrator.WithConfig(cfg),
+			orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+				return &mockPacketProcessor{subnets: subnets}, nil
+			}),
+			orchestrator.WithTLSFactory(func(ctx context.Context, socketPath, serverSVID string) (outbound.TLSConfigProvider, io.Closer, error) {
+				return &mockTLSProvider{}, io.NopCloser(nil), nil
+			}),
+			orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+				return mockCP
+			}),
+			orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+				return newMockListener(address), nil
+			}),
+		)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- orch.Run(ctx)
+		}()
+
+		time.Sleep(120 * time.Millisecond)
+
+		engine := orch.AuthzEngine()
+		if engine == nil {
+			t.Fatalf("expected Orchestrator.AuthzEngine() to be initialized")
+		}
+
+		// Initial snapshot policy is active.
+		d := engine.AuthorizeConnection(ctx, model.AuthzRequest{
+			CallerIdentity:     "spiffe://omnimesh.local/ns/default/sa/client",
+			CallerVerified:     true,
+			DestNamespace:      "default",
+			DestServiceName:    "my-service",
+			InboundL7Available: true,
+		})
+		if !d.Allowed || d.MatchedPolicy != "default/initial-allow" {
+			t.Fatalf("expected initial snapshot allow, got %+v", d)
+		}
+
+		// Streaming ScopeUpdate adds an emergency DENY.
+		updatesCh <- &omnimeshv1.ScopeUpdate{
+			Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_ADD,
+			AuthzPolicies: []*omnimeshv1.AuthzPolicyInfo{
+				{
+					Name:        "stream-deny",
+					Namespace:   "default",
+					Action:      "DENY",
+					Source:      &omnimeshv1.SelectorInfo{Namespace: "default", Name: "client"},
+					Destination: &omnimeshv1.SelectorInfo{Namespace: "default", Name: "my-service"},
+				},
+			},
+		}
+		time.Sleep(60 * time.Millisecond)
+
+		d = engine.AuthorizeConnection(ctx, model.AuthzRequest{
+			CallerIdentity:     "spiffe://omnimesh.local/ns/default/sa/client",
+			CallerVerified:     true,
+			DestNamespace:      "default",
+			DestServiceName:    "my-service",
+			InboundL7Available: true,
+		})
+		if d.Allowed || d.MatchedPolicy != "default/stream-deny" {
+			t.Fatalf("expected streaming ScopeUpdate DENY to take effect, got %+v", d)
+		}
+
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Fatalf("shutdown err: %v", err)
+		}
+	})
+
+	t.Run("replaces AuthzEngine state on control-plane reconnect snapshot", func(t *testing.T) {
+		mockCP := &mockControlPlaneClient{
+			failStreamCount: 1,
+			snapshotToReturn: &omnimeshv1.ScopeSnapshot{
+				Namespaces: []*omnimeshv1.NamespaceInfo{
+					{Name: "default", Cidr: "10.10.10.0/24", Subnets: []string{"10.10.10.0/24"}, Isolation: "strict"},
+				},
+				AuthzPolicies: []*omnimeshv1.AuthzPolicyInfo{
+					{
+						Name:        "initial-allow",
+						Namespace:   "default",
+						Action:      "ALLOW",
+						Source:      &omnimeshv1.SelectorInfo{Namespace: "default", Name: "client"},
+						Destination: &omnimeshv1.SelectorInfo{Namespace: "default", Name: "my-service"},
+					},
+				},
+			},
+			reconnectSnapshot: &omnimeshv1.ScopeSnapshot{
+				Namespaces: []*omnimeshv1.NamespaceInfo{
+					{Name: "default", Cidr: "10.10.10.0/24", Subnets: []string{"10.10.10.0/24"}, Isolation: "strict"},
+				},
+				AuthzPolicies: []*omnimeshv1.AuthzPolicyInfo{
+					{
+						Name:        "reconnect-allow",
+						Namespace:   "default",
+						Action:      "ALLOW",
+						Source:      &omnimeshv1.SelectorInfo{Namespace: "default", Name: "reconnected-client"},
+						Destination: &omnimeshv1.SelectorInfo{Namespace: "default", Name: "my-service"},
+					},
+				},
+			},
+		}
+
+		cfg := validTestConfig()
+		cfg.Spire.Disabled = false
+
+		orch := orchestrator.NewOrchestrator(
+			orchestrator.WithConfig(cfg),
+			orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+				return &mockPacketProcessor{subnets: subnets}, nil
+			}),
+			orchestrator.WithTLSFactory(func(ctx context.Context, socketPath, serverSVID string) (outbound.TLSConfigProvider, io.Closer, error) {
+				return &mockTLSProvider{}, io.NopCloser(nil), nil
+			}),
+			orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+				return mockCP
+			}),
+			orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+				return newMockListener(address), nil
+			}),
+			orchestrator.WithRetryInterval(10*time.Millisecond),
+		)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- orch.Run(ctx)
+		}()
+
+		var reconnectedAllowed bool
+		for i := 0; i < 40; i++ {
+			time.Sleep(25 * time.Millisecond)
+			if engine := orch.AuthzEngine(); engine != nil {
+				d := engine.AuthorizeConnection(ctx, model.AuthzRequest{
+					CallerIdentity:     "spiffe://omnimesh.local/ns/default/sa/reconnected-client",
+					CallerVerified:     true,
+					DestNamespace:      "default",
+					DestServiceName:    "my-service",
+					InboundL7Available: true,
+				})
+				if d.Allowed && d.MatchedPolicy == "default/reconnect-allow" {
+					reconnectedAllowed = true
+					break
+				}
+			}
+		}
+		if !reconnectedAllowed {
+			t.Fatalf("expected reconnect snapshot policy default/reconnect-allow to become active")
+		}
+
+		// Initial policy must have been replaced by reconnect snapshot.
+		d := orch.AuthzEngine().AuthorizeConnection(ctx, model.AuthzRequest{
+			CallerIdentity:     "spiffe://omnimesh.local/ns/default/sa/client",
+			CallerVerified:     true,
+			DestNamespace:      "default",
+			DestServiceName:    "my-service",
+			InboundL7Available: true,
+		})
+		if d.Allowed {
+			t.Fatalf("expected initial snapshot policy to be replaced after reconnect, got %+v", d)
+		}
+
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Fatalf("shutdown err: %v", err)
+		}
+	})
+}
+
