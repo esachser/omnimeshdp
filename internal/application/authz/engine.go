@@ -340,6 +340,13 @@ func WithObserver(obs inbound.AuthzDecisionObserver) EngineOption {
 	}
 }
 
+// WithPolicyCountObserver registers a callback invoked whenever the compiled policy count changes.
+func WithPolicyCountObserver(fn func(count int)) EngineOption {
+	return func(e *Engine) {
+		e.policyCountObserver = fn
+	}
+}
+
 // WithClock overrides the clock used for temporal policy evaluation (ValidFrom/ValidUntil).
 func WithClock(nowFn func() time.Time) EngineOption {
 	return func(e *Engine) {
@@ -352,14 +359,15 @@ func WithClock(nowFn func() time.Time) EngineOption {
 // Engine evaluates L4 and L7 SPIFFE-based authorization policies using an immutable,
 // lock-free atomic snapshot compiled from Control Plane updates and local config.
 type Engine struct {
-	mode             model.AuthzMode
-	defaultIsolation model.NamespaceIsolation
-	trustDomain      string
-	allowUnverified  bool
-	enforceL7        bool
-	auditLogAllows   bool
-	observer         inbound.AuthzDecisionObserver
-	nowFn            func() time.Time
+	mode                model.AuthzMode
+	defaultIsolation    model.NamespaceIsolation
+	trustDomain         string
+	allowUnverified     bool
+	enforceL7           bool
+	auditLogAllows      bool
+	observer            inbound.AuthzDecisionObserver
+	policyCountObserver func(int)
+	nowFn               func() time.Time
 
 	updateMu sync.Mutex
 	state    *rawAuthzState
@@ -516,6 +524,9 @@ func (e *Engine) ApplyUpdate(update *omnimeshv1.ScopeUpdate) {
 func (e *Engine) publishLocked() {
 	snap := compileSnapshot(e.state)
 	e.snapshot.Store(snap)
+	if e.policyCountObserver != nil {
+		e.policyCountObserver(snap.policyCount)
+	}
 }
 
 func compileSnapshot(state *rawAuthzState) *authzSnapshot {
@@ -874,6 +885,11 @@ func (e *Engine) Stats() model.AuthzStats {
 }
 
 func (e *Engine) evaluate(ctx context.Context, req model.AuthzRequest) model.AuthzDecision {
+	var evalStart time.Time
+	if e.observer != nil {
+		evalStart = time.Now()
+	}
+
 	snap := e.snapshot.Load()
 	if snap == nil {
 		snap = compileSnapshot(nil)
@@ -892,21 +908,21 @@ func (e *Engine) evaluate(ctx context.Context, req model.AuthzRequest) model.Aut
 			ResolvedDestServiceName: destName,
 			ResolvedProtocol:        destProto,
 		}
-		e.finalizeDecision(ctx, req, decision)
+		e.finalizeDecision(ctx, req, decision, evalStart)
 		return decision
 	}
 
 	// 2. Identity verification and SPIFFE URI parsing.
 	if !req.CallerVerified && !e.allowUnverified {
 		decision := e.modeOutcomeForDenied(model.AuthzReasonUnauthenticated, "", model.SPIFFEIdentity{}, destNS, destName, destProto)
-		e.finalizeDecision(ctx, req, decision)
+		e.finalizeDecision(ctx, req, decision, evalStart)
 		return decision
 	}
 
 	callerID, ok := model.ParseSPIFFEIdentity(req.CallerIdentity)
 	if !ok {
 		decision := e.modeOutcomeForDenied(model.AuthzReasonInvalidIdentity, "", model.SPIFFEIdentity{}, destNS, destName, destProto)
-		e.finalizeDecision(ctx, req, decision)
+		e.finalizeDecision(ctx, req, decision, evalStart)
 		return decision
 	}
 
@@ -943,7 +959,7 @@ func (e *Engine) evaluate(ctx context.Context, req model.AuthzRequest) model.Aut
 				ResolvedProtocol:        destProto,
 			}
 		}
-		e.finalizeDecision(ctx, req, decision)
+		e.finalizeDecision(ctx, req, decision, evalStart)
 		return decision
 	}
 
@@ -970,7 +986,7 @@ func (e *Engine) evaluate(ctx context.Context, req model.AuthzRequest) model.Aut
 			ResolvedDestServiceName: destName,
 			ResolvedProtocol:        destProto,
 		}
-		e.finalizeDecision(ctx, req, decision)
+		e.finalizeDecision(ctx, req, decision, evalStart)
 		return decision
 	}
 
@@ -989,7 +1005,7 @@ func (e *Engine) evaluate(ctx context.Context, req model.AuthzRequest) model.Aut
 				ResolvedDestServiceName: destName,
 				ResolvedProtocol:        destProto,
 			}
-			e.finalizeDecision(ctx, req, decision)
+			e.finalizeDecision(ctx, req, decision, evalStart)
 			return decision
 		}
 	}
@@ -1009,7 +1025,7 @@ func (e *Engine) evaluate(ctx context.Context, req model.AuthzRequest) model.Aut
 			ResolvedDestServiceName: destName,
 			ResolvedProtocol:        destProto,
 		}
-		e.finalizeDecision(ctx, req, decision)
+		e.finalizeDecision(ctx, req, decision, evalStart)
 		return decision
 	}
 
@@ -1021,7 +1037,7 @@ func (e *Engine) evaluate(ctx context.Context, req model.AuthzRequest) model.Aut
 		reason = model.AuthzReasonL7Mismatch
 	}
 	decision := e.modeOutcomeForDenied(reason, "", callerID, destNS, destName, destProto)
-	e.finalizeDecision(ctx, req, decision)
+	e.finalizeDecision(ctx, req, decision, evalStart)
 	return decision
 }
 
@@ -1479,7 +1495,10 @@ func normalizeAuthzPath(raw string) string {
 	return cleaned
 }
 
-func (e *Engine) finalizeDecision(ctx context.Context, req model.AuthzRequest, decision model.AuthzDecision) {
+func (e *Engine) finalizeDecision(ctx context.Context, req model.AuthzRequest, decision model.AuthzDecision, evalStart time.Time) {
+	if !evalStart.IsZero() {
+		decision.EvaluationDuration = time.Since(evalStart)
+	}
 	if decision.Allowed {
 		e.allowedTotal.Add(1)
 		if decision.DryRun && decision.WouldDeny {

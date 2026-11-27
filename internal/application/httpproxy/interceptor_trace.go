@@ -70,7 +70,9 @@ func (i *TraceContextInterceptor) OnRequest(_ context.Context, _ *model.Connecti
 		req.Headers = make(http.Header)
 	}
 
-	i.processTraceContext(req)
+	if !req.TraceContext.Valid {
+		i.processTraceContext(req)
+	}
 	i.processRequestID(req)
 	return nil
 }

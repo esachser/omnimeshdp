@@ -18,6 +18,7 @@ type AppConfig struct {
 	Routing       RoutingConfig       `json:"routing"`
 	HTTP          HTTPConfig          `json:"http"`
 	Authorization AuthorizationConfig `json:"authorization"`
+	Observability ObservabilityConfig `json:"observability"`
 	Services      []NodeServiceInfo   `json:"services"`
 	ServicesFile  string              `json:"services_file"`
 	ServicesDir   string              `json:"services_dir"`
@@ -76,6 +77,7 @@ func DefaultConfig() *AppConfig {
 		Routing:       DefaultRoutingConfig(),
 		HTTP:          DefaultHTTPConfig(),
 		Authorization: DefaultAuthorizationConfig(),
+		Observability: DefaultObservabilityConfig(),
 		Services:      make([]NodeServiceInfo, 0),
 		ServicesDir:   "./services.d/",
 	}
@@ -167,6 +169,9 @@ func LoadConfig(configPath string) (*AppConfig, error) {
 		return nil, err
 	}
 	applyAuthzEnvOverrides(&cfg.Authorization)
+	if err := applyObservabilityEnvOverrides(&cfg.Observability); err != nil {
+		return nil, err
+	}
 
 	// 3. Read services file if specified
 	if cfg.ServicesFile != "" {
@@ -210,6 +215,9 @@ func (c *AppConfig) Validate() error {
 	}
 	if err := c.Authorization.Validate(); err != nil {
 		return fmt.Errorf("invalid authorization configuration: %w", err)
+	}
+	if err := c.Observability.Validate(); err != nil {
+		return fmt.Errorf("invalid observability configuration: %w", err)
 	}
 	return nil
 }
@@ -278,4 +286,104 @@ func applyAuthzEnvOverrides(authzCfg *AuthorizationConfig) {
 	applyEnvBool("AUTHZ_ENFORCE_L7", &authzCfg.EnforceL7)
 	applyEnvString("AUTHZ_TRUST_DOMAIN", &authzCfg.TrustDomain)
 	applyEnvBool("AUTHZ_AUDIT_LOG_ALLOWS", &authzCfg.AuditLogAllows)
+}
+
+func applyObservabilityEnvOverrides(obsCfg *ObservabilityConfig) error {
+	applyEnvBool("OBSERVABILITY_METRICS_ENABLED", &obsCfg.Metrics.Enabled)
+	applyEnvString("OBSERVABILITY_METRICS_ENDPOINT", &obsCfg.Metrics.Endpoint)
+	applyEnvString("OBSERVABILITY_METRICS_PATH", &obsCfg.Metrics.Path)
+	applyEnvString("OBSERVABILITY_METRICS_EXPORT_INTERVAL", &obsCfg.Metrics.ExportInterval)
+	applyEnvBool("OBSERVABILITY_METRICS_COMBINED_REQUEST_ENABLED", &obsCfg.Metrics.CombinedRequestMetric.Enabled)
+
+	if ep := firstNonEmptyEnv("OBSERVABILITY_METRICS_OTLP_ENDPOINT"); ep != "" {
+		proto := normalizeOTLPProtocol(firstNonEmptyEnv("OBSERVABILITY_METRICS_OTLP_PROTOCOL"))
+		insecure := parseOptionalEnvBool("OBSERVABILITY_METRICS_OTLP_INSECURE")
+		upsertOTLPExporter(&obsCfg.Metrics.Exporters, proto, ep, insecure)
+	}
+
+	applyEnvBool("OBSERVABILITY_TRACES_ENABLED", &obsCfg.Traces.Enabled)
+	if sampler := firstNonEmptyEnv("OBSERVABILITY_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER"); sampler != "" {
+		obsCfg.Traces.Sampler = sampler
+	}
+	if rateStr := firstNonEmptyEnv("OBSERVABILITY_TRACES_SAMPLE_RATE", "OTEL_TRACES_SAMPLER_ARG"); rateStr != "" {
+		rate, err := strconv.ParseFloat(strings.TrimSpace(rateStr), 64)
+		if err != nil {
+			return fmt.Errorf("invalid trace sample rate %q: %w", rateStr, err)
+		}
+		obsCfg.Traces.SampleRate = rate
+	}
+	applyEnvBool("OBSERVABILITY_TRACES_ALWAYS_SAMPLE_ERRORS", &obsCfg.Traces.AlwaysSampleErrors)
+	if err := applyEnvInt("OBSERVABILITY_TRACES_MAX_ERROR_TRACES_PER_SEC", &obsCfg.Traces.MaxErrorTracesPerSec); err != nil {
+		return err
+	}
+
+	if ep := firstNonEmptyEnv(
+		"OBSERVABILITY_TRACES_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+	); ep != "" {
+		proto := normalizeOTLPProtocol(firstNonEmptyEnv(
+			"OBSERVABILITY_TRACES_OTLP_PROTOCOL",
+			"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+			"OTEL_EXPORTER_OTLP_PROTOCOL",
+		))
+		insecure := parseOptionalEnvBool("OBSERVABILITY_TRACES_OTLP_INSECURE")
+		upsertOTLPExporter(&obsCfg.Traces.Exporters, proto, ep, insecure)
+	}
+
+	if svcName := firstNonEmptyEnv("OBSERVABILITY_SERVICE_NAME", "OTEL_SERVICE_NAME"); svcName != "" {
+		obsCfg.Resource.ServiceName = svcName
+	}
+	applyEnvString("OBSERVABILITY_SERVICE_NAMESPACE", &obsCfg.Resource.ServiceNamespace)
+	applyEnvString("OBSERVABILITY_DEPLOYMENT_ENVIRONMENT", &obsCfg.Resource.DeploymentEnvironment)
+
+	return nil
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func parseOptionalEnvBool(key string) *bool {
+	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
+		parsed := parseBoolValue(val)
+		return &parsed
+	}
+	return nil
+}
+
+func normalizeOTLPProtocol(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "http", "http/protobuf", "otlp-http":
+		return "otlp-http"
+	default:
+		return "otlp-grpc"
+	}
+}
+
+func upsertOTLPExporter(exporters *[]TelemetryExporterConfig, typ, target string, insecure *bool) {
+	for i := range *exporters {
+		existingType := strings.ToLower(strings.TrimSpace((*exporters)[i].Type))
+		if existingType == "otlp-grpc" || existingType == "otlp-http" {
+			(*exporters)[i].Type = typ
+			(*exporters)[i].Target = target
+			if insecure != nil {
+				(*exporters)[i].Insecure = *insecure
+			}
+			return
+		}
+	}
+	exp := TelemetryExporterConfig{
+		Type:   typ,
+		Target: target,
+	}
+	if insecure != nil {
+		exp.Insecure = *insecure
+	}
+	*exporters = append(*exporters, exp)
 }

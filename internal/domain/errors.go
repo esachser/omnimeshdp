@@ -58,6 +58,10 @@ var (
 	ErrForbidden          = errors.New("access denied by authorization policy (403 Forbidden)")
 	ErrInvalidAuthzConfig = errors.New("invalid authorization configuration")
 	ErrUnauthorized       = errors.New("caller identity is missing or unverified")
+
+	// Observability errors per spec/observability.md
+	ErrInvalidObservabilityConfig = errors.New("invalid observability configuration")
+	ErrObservabilityInitFailed    = errors.New("failed to initialize observability pipeline")
 )
 
 // HTTPRejectError may be returned by an HTTP request interceptor to reject a request

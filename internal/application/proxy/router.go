@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"log"
 	"math/rand/v2"
 	"net/netip"
@@ -15,6 +16,7 @@ import (
 	omnimeshv1 "github.com/esachser/omnimeshcontrol/api/gen/omnimesh/v1"
 	"github.com/esachser/omnimeshdp/internal/domain"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
+	"github.com/esachser/omnimeshdp/internal/port/outbound"
 )
 
 /*
@@ -441,6 +443,7 @@ type routeSnapshot struct {
 	namespaces     []*omnimeshv1.NamespaceInfo
 	subnets        []string
 	defaultRetry   model.RetryConfig
+	metrics        outbound.MetricRecorder
 }
 
 func emptySnapshot(defaultRetry model.RetryConfig) *routeSnapshot {
@@ -455,13 +458,15 @@ func emptySnapshot(defaultRetry model.RetryConfig) *routeSnapshot {
 // Router maintains mesh routing tables derived from ScopeSnapshot and ScopeUpdate messages.
 // Reads on the data path are lock-free via atomic snapshot swaps.
 type Router struct {
-	updateMu      sync.Mutex
-	config        *routeConfig
-	snapshot      atomic.Pointer[routeSnapshot]
-	nodeID        string
-	target        string
-	targetAddress string
-	defaultRetry  model.RetryConfig
+	updateMu          sync.Mutex
+	config            *routeConfig
+	snapshot          atomic.Pointer[routeSnapshot]
+	nodeID            string
+	target            string
+	targetAddress     string
+	defaultRetry      model.RetryConfig
+	metrics           outbound.MetricRecorder
+	publishedServices map[serviceKey]struct{}
 
 	trackerMu    sync.RWMutex
 	connTrackers map[model.EndpointKey]*atomic.Int64
@@ -501,6 +506,14 @@ func (r *Router) SetRoutingConfig(cfg model.RoutingConfig) error {
 	r.defaultRetry = parsed
 	r.publishLocked()
 	return nil
+}
+
+// SetMetrics configures an optional MetricRecorder for load balancing and endpoint health gauges.
+func (r *Router) SetMetrics(metrics outbound.MetricRecorder) {
+	r.updateMu.Lock()
+	defer r.updateMu.Unlock()
+	r.metrics = metrics
+	r.publishLocked()
 }
 
 // DefaultRetryConfig returns the active default RetryConfig.
@@ -640,7 +653,47 @@ func (r *Router) ApplyUpdate(update *omnimeshv1.ScopeUpdate) {
 // Caller must hold r.updateMu.
 func (r *Router) publishLocked() {
 	snap := r.compileSnapshotLocked(r.config)
+	snap.metrics = r.metrics
 	r.snapshot.Store(snap)
+	r.emitEndpointGaugesLocked(snap)
+}
+
+func (r *Router) emitEndpointGaugesLocked(snap *routeSnapshot) {
+	if r.metrics == nil || snap == nil {
+		return
+	}
+	ctx := context.Background()
+	nextServices := make(map[serviceKey]struct{}, len(snap.plansByIP))
+	for _, plan := range snap.plansByIP {
+		if plan == nil || plan.serviceName == "" {
+			continue
+		}
+		sk := serviceKey{namespace: plan.namespace, name: plan.serviceName}
+		nextServices[sk] = struct{}{}
+		destSvc := formatServiceAttr(plan.namespace, plan.serviceName)
+		r.metrics.RecordGauge(ctx, outbound.MetricLBEndpointsHealthy, float64(len(plan.allEndpoints)),
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: plan.namespace},
+		)
+		r.metrics.RecordGauge(ctx, outbound.MetricLBEndpointsTotal, float64(plan.rawEndpointCount),
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: plan.namespace},
+		)
+	}
+	for prevSK := range r.publishedServices {
+		if _, ok := nextServices[prevSK]; !ok {
+			destSvc := formatServiceAttr(prevSK.namespace, prevSK.name)
+			r.metrics.RecordGauge(ctx, outbound.MetricLBEndpointsHealthy, 0,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: prevSK.namespace},
+			)
+			r.metrics.RecordGauge(ctx, outbound.MetricLBEndpointsTotal, 0,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: prevSK.namespace},
+			)
+		}
+	}
+	r.publishedServices = nextServices
 }
 
 func (r *Router) compileSnapshotLocked(cfg *routeConfig) *routeSnapshot {
@@ -1052,7 +1105,7 @@ func (r *Router) ResolveRouteWithExclusions(
 	if realDest == "" || int32(destPort) != plan.defaultPort {
 		realDest = formatHostPort(destIP, destPort)
 	}
-	return resolveFromPlan(plan, realDest, defaultTargetHost, excluded)
+	return resolveFromPlan(plan, realDest, defaultTargetHost, excluded, snap.metrics)
 }
 
 // ResolveRouteIPv4 resolves a route for a big-endian uint32 IPv4 address on the hot path,
@@ -1077,7 +1130,7 @@ func (r *Router) ResolveRouteIPv4(
 	if realDest == "" || int32(destPort) != plan.defaultPort {
 		realDest = formatIPv4Port(destIP, destPort)
 	}
-	return resolveFromPlan(plan, realDest, defaultTargetHost, excluded)
+	return resolveFromPlan(plan, realDest, defaultTargetHost, excluded, snap.metrics)
 }
 
 // HasAvailableEndpointIPv4 reports whether at least one non-excluded eligible endpoint
@@ -1118,6 +1171,7 @@ func resolveFromPlan(
 	realDest string,
 	defaultTargetHost string,
 	excluded []model.EndpointKey,
+	metrics outbound.MetricRecorder,
 ) (*model.ResolvedRoute, model.RetryConfig, error) {
 	if plan.rawEndpointCount == 0 {
 		if len(excluded) == 0 && defaultTargetHost != "" {
@@ -1135,6 +1189,11 @@ func resolveFromPlan(
 	}
 
 	if len(plan.allEndpoints) == 0 {
+		if metrics != nil {
+			metrics.AddCounter(context.Background(), outbound.MetricLBNoHealthyEndpoints, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: formatServiceAttr(plan.namespace, plan.serviceName)},
+			)
+		}
 		return nil, plan.retry, domain.ErrNoHealthyEndpoints
 	}
 
@@ -1163,6 +1222,14 @@ func resolveFromPlan(
 		targetHost = defaultTargetHost
 	}
 
+	if metrics != nil {
+		metrics.AddCounter(context.Background(), outbound.MetricLBSelectionsTotal, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: formatServiceAttr(plan.namespace, plan.serviceName)},
+			model.MetricAttribute{Key: outbound.MetricAttrEndpoint, Value: targetHost},
+			model.MetricAttribute{Key: outbound.MetricAttrAlgorithm, Value: lbAlgorithmLabel(plan.algorithm)},
+		)
+	}
+
 	return &model.ResolvedRoute{
 		TargetHost:  targetHost,
 		RealDest:    realDest,
@@ -1173,6 +1240,27 @@ func resolveFromPlan(
 		Protocol:    plan.protocol,
 		EndpointKey: chosen.key,
 	}, plan.retry, nil
+}
+
+func formatServiceAttr(ns, name string) string {
+	if ns != "" && name != "" {
+		return ns + "/" + name
+	}
+	if name != "" {
+		return name
+	}
+	return "unknown"
+}
+
+func lbAlgorithmLabel(alg omnimeshv1.LoadBalancerAlgorithm) string {
+	switch alg {
+	case omnimeshv1.LoadBalancerAlgorithm_LOAD_BALANCER_ALGORITHM_WEIGHTED_ROUND_ROBIN:
+		return "weighted_round_robin"
+	case omnimeshv1.LoadBalancerAlgorithm_LOAD_BALANCER_ALGORITHM_LEAST_CONNECTIONS:
+		return "least_connections"
+	default:
+		return "random"
+	}
 }
 
 func selectFromWeightedGroups(plan *compiledServicePlan, excluded []model.EndpointKey) (*compiledEndpoint, error) {

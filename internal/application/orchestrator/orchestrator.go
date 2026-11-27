@@ -15,6 +15,7 @@ import (
 
 	omnimeshv1 "github.com/esachser/omnimeshcontrol/api/gen/omnimesh/v1"
 	adaptergrpc "github.com/esachser/omnimeshdp/internal/adapter/outbound/grpc"
+	"github.com/esachser/omnimeshdp/internal/adapter/outbound/oteltelemetry"
 	"github.com/esachser/omnimeshdp/internal/adapter/outbound/spiffe"
 	"github.com/esachser/omnimeshdp/internal/application/agent"
 	"github.com/esachser/omnimeshdp/internal/application/authz"
@@ -55,9 +56,12 @@ type Orchestrator struct {
 	svidFactory      WorkloadSVIDProviderFactory
 	cpClientFactory  ControlPlaneClientFactory
 	listenerOpener   ListenerOpener
-	retryInterval    time.Duration
-	httpInterceptors []outbound.HeaderInterceptor
-	authzObserver    inbound.AuthzDecisionObserver
+	retryInterval         time.Duration
+	httpInterceptors      []outbound.HeaderInterceptor
+	authzObserver         inbound.AuthzDecisionObserver
+	telemetry             outbound.TelemetryProvider
+	telemetryOwned        bool
+	metricsListenerOpener ListenerOpener
 
 	// Internal state across steps
 	runCtx             context.Context
@@ -66,6 +70,7 @@ type Orchestrator struct {
 	tlsCloser          io.Closer
 	svidProvider       outbound.WorkloadSVIDProvider
 	svidCloser         io.Closer
+	svidMonitor        *oteltelemetry.SVIDMonitor
 	internalListener   net.Listener
 	externalListener   net.Listener
 	clientSideService  *proxy.ClientSideService
@@ -164,6 +169,20 @@ func WithAuthzObserver(observer inbound.AuthzDecisionObserver) Option {
 	}
 }
 
+// WithTelemetryProvider injects a pre-built TelemetryProvider (e.g., for testing).
+func WithTelemetryProvider(provider outbound.TelemetryProvider) Option {
+	return func(o *Orchestrator) {
+		o.telemetry = provider
+	}
+}
+
+// WithMetricsListenerOpener overrides how the Prometheus HTTP metrics listener is bound.
+func WithMetricsListenerOpener(fn ListenerOpener) Option {
+	return func(o *Orchestrator) {
+		o.metricsListenerOpener = fn
+	}
+}
+
 // NewOrchestrator creates a new Orchestrator with default factories and options.
 func NewOrchestrator(opts ...Option) *Orchestrator {
 	o := &Orchestrator{
@@ -217,6 +236,22 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	log.Printf("[Step 1/10] Configuration loaded successfully. Node ID: %s, Interception: %s\n",
 		o.config.ControlPlane.NodeID, o.config.Interception.Type)
 
+	// Initialize OpenTelemetry metrics & tracing pipeline if enabled.
+	if o.telemetry == nil && (o.config.Observability.Metrics.Enabled || o.config.Observability.Traces.Enabled) {
+		var otelOpts []oteltelemetry.Option
+		if o.metricsListenerOpener != nil {
+			otelOpts = append(otelOpts, oteltelemetry.WithMetricsListenerOpener(o.metricsListenerOpener))
+		}
+		tp, err := oteltelemetry.NewProvider(ctx, o.config.Observability, o.config.ControlPlane.NodeID, otelOpts...)
+		if err != nil {
+			return fmt.Errorf("%w: %w", domain.ErrObservabilityInitFailed, err)
+		}
+		o.mu.Lock()
+		o.telemetry = tp
+		o.telemetryOwned = true
+		o.mu.Unlock()
+	}
+
 	// Step 2: Connect to the Spire Agent to get a mTLS configuration.
 	log.Println("[Step 2/10] Connecting to Spire Agent to get mTLS configuration...")
 	if o.config.Spire.Disabled {
@@ -258,6 +293,15 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		log.Println("[Step 2/10] Successfully obtained mTLS configuration from Spire Agent.")
 	}
 
+	if o.telemetry != nil {
+		if sp, ok := o.tlsProvider.(*spiffe.SpiffeTLSProvider); ok {
+			o.svidMonitor = oteltelemetry.NewSVIDMonitor(ctx, sp.Source(), o.telemetry.Metrics())
+		}
+		if dp, ok := o.svidProvider.(*spiffe.DelegatedWorkloadProvider); ok {
+			dp.SetMetrics(o.telemetry.Metrics())
+		}
+	}
+
 	// Step 3: Open the internal and external ports to listen for incoming connections.
 	// - The next step must only run after this one succeeds.
 	log.Println("[Step 3/10] Opening internal and external ports...")
@@ -279,12 +323,18 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 
 	// Hand off listeners to proxy services
 	o.router = proxy.NewRouterWithNode(o.config.ControlPlane.NodeID, o.config.ControlPlane.Target)
+	if o.telemetry != nil {
+		o.router.SetMetrics(o.telemetry.Metrics())
+	}
 	if err := o.router.SetRoutingConfig(o.config.Routing); err != nil {
 		log.Printf("[Step 3/10] Warning: invalid routing configuration, using defaults: %v\n", err)
 	}
 	o.clientSideService = proxy.NewClientSideService(o.config.Listeners.InternalAddr, "", nil)
 	o.clientSideService.SetRouter(o.router)
 	o.clientSideService.SetNodeID(o.config.ControlPlane.NodeID)
+	if o.telemetry != nil {
+		o.clientSideService.SetTelemetry(o.telemetry)
+	}
 	if err := o.clientSideService.SetRoutingConfig(o.config.Routing); err != nil {
 		log.Printf("[Step 3/10] Warning: invalid client routing configuration, using defaults: %v\n", err)
 	}
@@ -302,6 +352,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 	o.serverSideService = proxy.NewServerSideService(o.config.Listeners.ExternalAddr, serverTLS)
 	o.serverSideService.SetNodeID(o.config.ControlPlane.NodeID)
+	if o.telemetry != nil {
+		o.serverSideService.SetTelemetry(o.telemetry)
+	}
 
 	authzEngine, err := o.buildAuthzEngine()
 	if err != nil {
@@ -319,6 +372,9 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		_ = extLn.Close()
 		return fmt.Errorf("%w: %w", domain.ErrConfigLoadFailed, err)
 	} else if httpBridge != nil {
+		if o.telemetry != nil {
+			httpBridge.SetTelemetry(o.telemetry)
+		}
 		if o.config.Authorization.EnforceL7 && o.config.Authorization.NormalizedMode() != model.AuthzModeDisabled {
 			httpBridge.SetAuthorizer(authzEngine)
 		}
@@ -443,10 +499,15 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	}
 
 	// Start dynamic service manager (directory watcher and health probers)
+	var healthMetrics outbound.MetricRecorder
+	if o.telemetry != nil {
+		healthMetrics = o.telemetry.Metrics()
+	}
 	svcMgr := service.NewManager(service.ManagerConfig{
 		ServicesDir:       o.config.ServicesDir,
 		InitialServices:   o.servicesToDeploy,
 		ControlPlaneAgent: o.controlPlaneAgent,
+		Metrics:           healthMetrics,
 		OnServicesChange: func(added, removed []model.NodeServiceInfo) {
 			if o.serverSideService != nil {
 				o.serverSideService.UpdateServices(added, removed)
@@ -507,8 +568,15 @@ func (o *Orchestrator) Cleanup() {
 	procCancel := o.processorCancel
 	svcMgr := o.serviceManager
 	o.serviceManager = nil
+	svidMon := o.svidMonitor
+	o.svidMonitor = nil
+	tp := o.telemetry
+	tpOwned := o.telemetryOwned
 	o.mu.Unlock()
 
+	if svidMon != nil {
+		svidMon.Stop()
+	}
 	if svcMgr != nil {
 		_ = svcMgr.Close()
 	}
@@ -546,6 +614,21 @@ func (o *Orchestrator) Cleanup() {
 	case <-time.After(5 * time.Second):
 		log.Println("Cleanup timeout exceeded while waiting for background goroutines.")
 	}
+
+	if tpOwned && tp != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := tp.Shutdown(shutCtx); err != nil {
+			log.Printf("Observability shutdown error: %v\n", err)
+		}
+		cancel()
+	}
+}
+
+// Telemetry returns the active TelemetryProvider used by the Orchestrator, or nil if disabled.
+func (o *Orchestrator) Telemetry() outbound.TelemetryProvider {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.telemetry
 }
 
 // ServiceManager returns the dynamic ServiceManager used by the Orchestrator, or nil if not running.
@@ -829,8 +912,19 @@ func (o *Orchestrator) buildAuthzEngine() (*authz.Engine, error) {
 	if trustDomain != "" {
 		opts = append(opts, authz.WithTrustDomain(trustDomain))
 	}
-	if o.authzObserver != nil {
-		opts = append(opts, authz.WithObserver(o.authzObserver))
+	var combinedObs inbound.AuthzDecisionObserver
+	if o.telemetry != nil {
+		otelObs := oteltelemetry.NewAuthzObserver(o.telemetry.Metrics(), o.telemetry.Tracer())
+		combinedObs = oteltelemetry.NewMultiAuthzObserver(otelObs, o.authzObserver)
+		metrics := o.telemetry.Metrics()
+		opts = append(opts, authz.WithPolicyCountObserver(func(count int) {
+			metrics.RecordGauge(context.Background(), outbound.MetricAuthzPoliciesCached, float64(count))
+		}))
+	} else {
+		combinedObs = o.authzObserver
+	}
+	if combinedObs != nil {
+		opts = append(opts, authz.WithObserver(combinedObs))
 	}
 
 	return authz.NewEngine(o.config.Authorization, opts...)

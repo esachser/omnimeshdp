@@ -1,6 +1,7 @@
 package service_test
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -11,8 +12,12 @@ import (
 	"time"
 
 	omnimeshv1 "github.com/esachser/omnimeshcontrol/api/gen/omnimesh/v1"
+	"github.com/esachser/omnimeshdp/internal/adapter/outbound/oteltelemetry"
 	"github.com/esachser/omnimeshdp/internal/application/service"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
+	"github.com/esachser/omnimeshdp/internal/port/outbound"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestHealthCheckerTCP(t *testing.T) {
@@ -155,6 +160,88 @@ func TestHealthCheckerHTTPTransitions(t *testing.T) {
 	reports := checker.GetAllReports()
 	if len(reports) != 1 {
 		t.Errorf("expected 1 report from GetAllReports, got %d", len(reports))
+	}
+}
+
+func TestHealthCheckerObservabilityMetrics(t *testing.T) {
+	var healthy atomic.Bool
+	healthy.Store(true)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if healthy.Load() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	reader := sdkmetric.NewManualReader()
+	tp, err := oteltelemetry.NewProvider(context.Background(), model.DefaultObservabilityConfig(), "node-health", oteltelemetry.WithMetricReader(reader))
+	if err != nil {
+		t.Fatalf("NewProvider failed: %v", err)
+	}
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	statusCh := make(chan omnimeshv1.EndpointHealthStatus, 4)
+	checker := service.NewHealthChecker(func(_ model.NodeServiceInfo, report *omnimeshv1.HealthReport) {
+		statusCh <- report.Status
+	})
+	checker.SetMetrics(tp.Metrics())
+	defer checker.Close()
+
+	checker.StartService(model.NodeServiceInfo{
+		Namespace: "prod",
+		Name:      "orders",
+		ID:        "orders-1",
+		HealthCheck: &model.HealthCheckConfig{
+			Type:               "HTTP",
+			Address:            ts.URL,
+			Path:               "/healthz",
+			Interval:           "40ms",
+			Timeout:            "50ms",
+			HealthyThreshold:   1,
+			UnhealthyThreshold: 1,
+		},
+	})
+
+	select {
+	case st := <-statusCh:
+		if st != omnimeshv1.EndpointHealthStatus_ENDPOINT_HEALTH_STATUS_HEALTHY {
+			t.Fatalf("expected HEALTHY, got %v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for HEALTHY transition")
+	}
+
+	healthy.Store(false)
+	select {
+	case st := <-statusCh:
+		if st != omnimeshv1.EndpointHealthStatus_ENDPOINT_HEALTH_STATUS_UNHEALTHY {
+			t.Fatalf("expected UNHEALTHY, got %v", st)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for UNHEALTHY transition")
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+	found := map[string]bool{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			found[m.Name] = true
+		}
+	}
+	for _, expected := range []string{
+		outbound.MetricHealthProbesTotal,
+		outbound.MetricHealthProbesDurationMs,
+		outbound.MetricHealthTransitions,
+	} {
+		if !found[expected] {
+			t.Fatalf("expected metric %q, got %+v", expected, found)
+		}
 	}
 }
 

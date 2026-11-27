@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1369,6 +1371,99 @@ func TestOrchestrator_AuthzConfigValidationAndLifecycleSync(t *testing.T) {
 		cancel()
 		if err := <-errCh; err != nil {
 			t.Fatalf("shutdown err: %v", err)
+		}
+	})
+}
+
+func TestOrchestratorObservabilityLifecycleAndValidation(t *testing.T) {
+	t.Run("InvalidObservabilityConfigFailsFast", func(t *testing.T) {
+		cfg := validTestConfig()
+		cfg.Observability.Metrics.Enabled = true
+		cfg.Observability.Metrics.Endpoint = "bad-endpoint"
+
+		orch := orchestrator.NewOrchestrator(
+			orchestrator.WithConfig(cfg),
+			orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+				return &mockPacketProcessor{subnets: subnets}, nil
+			}),
+		)
+
+		err := orch.Run(context.Background())
+		if !errors.Is(err, domain.ErrObservabilityInitFailed) {
+			t.Fatalf("expected ErrObservabilityInitFailed, got %v", err)
+		}
+	})
+
+	t.Run("PrometheusEndpointActiveAndShutsDownCleanly", func(t *testing.T) {
+		cfg := validTestConfig()
+		cfg.Spire.Disabled = true
+		cfg.Observability.Metrics.Enabled = true
+		cfg.Observability.Metrics.Endpoint = "127.0.0.1:0"
+		cfg.Observability.Metrics.Path = "/metrics"
+
+		mockCP := &mockControlPlaneClient{
+			updatesCh: make(chan *omnimeshv1.ScopeUpdate, 1),
+		}
+
+		var metricsAddr atomic.Value
+		orch := orchestrator.NewOrchestrator(
+			orchestrator.WithConfig(cfg),
+			orchestrator.WithProcessorFactory(func(interceptionType string, subnets []string, internalPort uint16) (outbound.PacketProcessor, error) {
+				return &mockPacketProcessor{subnets: subnets}, nil
+			}),
+			orchestrator.WithControlPlaneClientFactory(func(addr string, tlsProvider outbound.TLSConfigProvider) outbound.ControlPlaneClient {
+				return mockCP
+			}),
+			orchestrator.WithListenerOpener(func(network, address string) (net.Listener, error) {
+				return newMockListener(address), nil
+			}),
+			orchestrator.WithMetricsListenerOpener(func(network, address string) (net.Listener, error) {
+				ln, err := net.Listen(network, address)
+				if err == nil {
+					metricsAddr.Store(ln.Addr().String())
+				}
+				return ln, err
+			}),
+		)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- orch.Run(ctx)
+		}()
+
+		var addr string
+		for i := 0; i < 40; i++ {
+			if v, ok := metricsAddr.Load().(string); ok && v != "" && orch.AuthzEngine() != nil && orch.Router() != nil {
+				addr = v
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		if addr == "" {
+			cancel()
+			t.Fatalf("timed out waiting for orchestrator observability server")
+		}
+
+		resp, err := http.Get("http://" + addr + "/metrics")
+		if err != nil {
+			cancel()
+			t.Fatalf("GET /metrics failed: %v", err)
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			cancel()
+			t.Fatalf("expected 200 from /metrics, got %d", resp.StatusCode)
+		}
+		if !strings.Contains(string(bodyBytes), "omnimesh_agent_lb_endpoints_healthy") {
+			cancel()
+			t.Fatalf("expected omnimesh_agent_lb_endpoints_healthy in live /metrics output, got:\n%s", string(bodyBytes))
+		}
+
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Fatalf("orchestrator exited with error: %v", err)
 		}
 	})
 }

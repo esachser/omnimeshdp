@@ -2,6 +2,7 @@ package httpproxy
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +35,7 @@ type proxyExchange struct {
 	respCtx   *model.HTTPResponseContext
 	resRef    *http.Response
 	rejected  *domain.HTTPRejectError
+	span      outbound.SpanHandle
 	err       error
 }
 
@@ -51,6 +54,9 @@ type Bridge struct {
 	meshInjector  *MeshMetadataInterceptor
 	rules         *RuleEngineInterceptor
 	custom        []outbound.HeaderInterceptor
+
+	telemetryMu sync.RWMutex
+	telemetry   outbound.TelemetryProvider
 
 	bufPool *copyBufferPool
 }
@@ -112,6 +118,23 @@ func (b *Bridge) SetAuthorizer(authorizer inbound.Authorizer) {
 	b.authz = NewAuthzInterceptor(authorizer)
 }
 
+// SetTelemetry configures the TelemetryProvider used for L7 HTTP/gRPC and L4 TCP metrics and tracing.
+func (b *Bridge) SetTelemetry(tp outbound.TelemetryProvider) {
+	b.telemetryMu.Lock()
+	defer b.telemetryMu.Unlock()
+	b.telemetry = tp
+}
+
+func (b *Bridge) telemetryRecorders() (outbound.MetricRecorder, outbound.TraceRecorder) {
+	b.telemetryMu.RLock()
+	tp := b.telemetry
+	b.telemetryMu.RUnlock()
+	if tp == nil {
+		return nil, nil
+	}
+	return tp.Metrics(), tp.Tracer()
+}
+
 // InboundL7Enabled reports whether L7 HTTP inspection is currently enabled for inbound connections.
 func (b *Bridge) InboundL7Enabled() bool {
 	return b.isDirectionEnabled(model.DirectionInbound)
@@ -137,14 +160,19 @@ func (b *Bridge) Bridge(ctx context.Context, downstream net.Conn, upstream net.C
 	defer downstream.Close()
 	defer upstream.Close()
 
+	_, tracer := b.telemetryRecorders()
+
 	if !b.isDirectionEnabled(meta.Direction) || meta.ConfiguredProto == model.ProtocolTCP {
 		meta.DetectedProto = model.ProtocolTCP
 		if meta.AuthzRequiresL7 {
 			log.Printf("[Authz] event=authz.denied layer=l7 reason=l7_required caller=%q dest_service=%s/%s node_service_id=%q\n",
 				meta.CallerIdentity, meta.Namespace, meta.ServiceName, meta.NodeServiceID)
+			if tracer != nil {
+				tracer.SpanFromContext(ctx).SetError(domain.ErrForbidden, "l7 authorization required")
+			}
 			return domain.ErrForbidden
 		}
-		return b.bridgeL4(ctx, downstream, upstream)
+		return b.bridgeL4(ctx, downstream, upstream, meta)
 	}
 
 	var targetConn net.Conn = downstream
@@ -165,26 +193,55 @@ func (b *Bridge) Bridge(ctx context.Context, downstream net.Conn, upstream net.C
 
 	switch proto {
 	case model.ProtocolHTTP1:
+		if tracer != nil {
+			if outer := tracer.SpanFromContext(ctx); outer != nil {
+				outer.SetName(outbound.SpanNameHBONETunnel)
+			}
+		}
 		return b.proxyHTTP1(ctx, targetConn, upstream, meta)
 	case model.ProtocolHTTP2:
+		if tracer != nil {
+			if outer := tracer.SpanFromContext(ctx); outer != nil {
+				outer.SetName(outbound.SpanNameHBONETunnel)
+			}
+		}
 		return b.proxyHTTP2(ctx, targetConn, upstream, meta)
 	default:
 		if meta.AuthzRequiresL7 {
 			log.Printf("[Authz] event=authz.denied layer=l7 reason=l7_required caller=%q dest_service=%s/%s node_service_id=%q\n",
 				meta.CallerIdentity, meta.Namespace, meta.ServiceName, meta.NodeServiceID)
+			if tracer != nil {
+				tracer.SpanFromContext(ctx).SetError(domain.ErrForbidden, "l7 authorization required")
+			}
 			return domain.ErrForbidden
 		}
-		return b.bridgeL4(ctx, targetConn, upstream)
+		return b.bridgeL4(ctx, targetConn, upstream, meta)
 	}
 }
 
-func (b *Bridge) bridgeL4(ctx context.Context, downstream net.Conn, upstream net.Conn) error {
+func (b *Bridge) bridgeL4(ctx context.Context, downstream net.Conn, upstream net.Conn, meta model.ConnectionMeta) error {
+	metrics, tracer := b.telemetryRecorders()
+	start := time.Now()
+	srcSvc, srcNS := model.ParseCallerService(meta.CallerIdentity)
+	destSvc, destNS := formatBridgeDestLabels(meta)
+
+	if tracer != nil {
+		tracer.SpanFromContext(ctx).SetAttributes(model.MetricAttribute{Key: outbound.AttrProtocol, Value: "tcp"})
+	}
+	if metrics != nil {
+		metrics.AddUpDownCounter(ctx, outbound.MetricRequestsActive, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+		)
+	}
+
 	stop := context.AfterFunc(ctx, func() {
 		_ = downstream.Close()
 		_ = upstream.Close()
 	})
 	defer stop()
 
+	var bytesSent, bytesReceived int64
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -192,7 +249,8 @@ func (b *Bridge) bridgeL4(ctx context.Context, downstream net.Conn, upstream net
 		defer wg.Done()
 		buf := b.bufPool.Get()
 		defer b.bufPool.Put(buf)
-		_, _ = io.CopyBuffer(upstream, downstream, buf)
+		n, _ := io.CopyBuffer(upstream, downstream, buf)
+		bytesSent = n
 		if cw, ok := upstream.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
@@ -202,13 +260,64 @@ func (b *Bridge) bridgeL4(ctx context.Context, downstream net.Conn, upstream net
 		defer wg.Done()
 		buf := b.bufPool.Get()
 		defer b.bufPool.Put(buf)
-		_, _ = io.CopyBuffer(downstream, upstream, buf)
+		n, _ := io.CopyBuffer(downstream, upstream, buf)
+		bytesReceived = n
 		if cw, ok := downstream.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
 	}()
 
 	wg.Wait()
+
+	if metrics != nil {
+		metrics.AddUpDownCounter(context.Background(), outbound.MetricRequestsActive, -1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+		)
+		durMs := float64(time.Since(start).Nanoseconds()) / 1e6
+		if metrics.CombinedRequestMetricEnabled() {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrSourceNamespace, Value: srcNS},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+				model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: "ok"},
+			)
+		}
+		if meta.Direction == model.DirectionInbound {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsIngressTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrSourceNamespace, Value: srcNS},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+				model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: "ok"},
+			)
+		} else {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsEgressTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+				model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: "ok"},
+			)
+		}
+		metrics.RecordHistogram(context.Background(), outbound.MetricRequestsDurationMs, durMs,
+			model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+		)
+		if bytesSent > 0 {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesSent, bytesSent,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			)
+		}
+		if bytesReceived > 0 {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesReceived, bytesReceived,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			)
+		}
+	}
 	return nil
 }
 
@@ -231,6 +340,15 @@ func (b *Bridge) newReverseProxyHandler(baseTransport http.RoundTripper, meta mo
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		ex := &proxyExchange{startTime: time.Now()}
 		crw := &countingResponseWriter{ResponseWriter: rw}
+
+		metrics, _ := b.telemetryRecorders()
+		destSvc, destNS := formatBridgeDestLabels(meta)
+		if metrics != nil {
+			metrics.AddUpDownCounter(req.Context(), outbound.MetricRequestsActive, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+			)
+		}
 
 		var bodyCounter *countingReadCloser
 		if req.Body != nil && req.Body != http.NoBody {
@@ -389,8 +507,106 @@ func (b *Bridge) runRequestPipeline(ctx context.Context, conn *model.ConnectionM
 	if b.meshSanitizer != nil {
 		b.meshSanitizer.SanitizeRequest(conn, req)
 	}
+
+	pipeCtx := ctx
+	if _, tracer := b.telemetryRecorders(); tracer != nil {
+		carrier := outbound.HTTPHeaderCarrier(req.Headers)
+		extractedCtx := tracer.ExtractContext(context.Background(), carrier)
+		extractedSC := tracer.SpanContextFromContext(extractedCtx)
+
+		parentCtx := extractedCtx
+		if !extractedSC.Valid {
+			if conn != nil && conn.Direction == model.DirectionInbound {
+				parentCtx = ctx
+			} else {
+				parentCtx = context.Background()
+			}
+		}
+
+		spanName := outbound.SpanNameEgress
+		spanKind := model.SpanKindClient
+		dirLabel := "egress"
+		nodeLabel := ""
+		if conn != nil {
+			nodeLabel = conn.SourceNodeID
+			if conn.Direction == model.DirectionInbound {
+				spanName = outbound.SpanNameIngress
+				spanKind = model.SpanKindServer
+				dirLabel = "ingress"
+				nodeLabel = conn.DestNodeID
+			}
+		}
+
+		srcSvc, srcNS := "unknown", "unknown"
+		destSvc, destNS, destAddr := "unknown", "unknown", ""
+		if conn != nil {
+			srcSvc, srcNS = model.ParseCallerService(conn.CallerIdentity)
+			destSvc, destNS = formatBridgeDestLabels(*conn)
+			destAddr = conn.DestAddr
+		}
+
+		reqPath := "/"
+		if req.URL != nil && req.URL.Path != "" {
+			reqPath = req.URL.Path
+		}
+		isGRPC := isGRPCContentType(req.Headers.Get("Content-Type"))
+		protoAttr := "http"
+		if isGRPC {
+			protoAttr = "grpc"
+		}
+
+		attrs := []model.MetricAttribute{
+			{Key: outbound.AttrDirection, Value: dirLabel},
+			{Key: outbound.AttrNode, Value: nodeLabel},
+			{Key: outbound.AttrSourceService, Value: srcSvc},
+			{Key: outbound.AttrSourceNamespace, Value: srcNS},
+			{Key: outbound.AttrDestinationService, Value: destSvc},
+			{Key: outbound.AttrDestinationNamespace, Value: destNS},
+			{Key: outbound.AttrDestinationEndpoint, Value: destAddr},
+			{Key: outbound.AttrProtocol, Value: protoAttr},
+			{Key: outbound.AttrHTTPMethod, Value: req.Method},
+			{Key: outbound.AttrHTTPURL, Value: reqPath},
+		}
+		if isGRPC {
+			grpcSvc, grpcMethod := parseGRPCPath(reqPath)
+			attrs = append(attrs, model.MetricAttribute{Key: outbound.AttrRPCSystem, Value: "grpc"})
+			if grpcSvc != "" {
+				attrs = append(attrs, model.MetricAttribute{Key: outbound.AttrRPCService, Value: grpcSvc})
+			}
+			if grpcMethod != "" {
+				attrs = append(attrs, model.MetricAttribute{Key: outbound.AttrRPCMethod, Value: grpcMethod})
+			}
+		}
+
+		var span outbound.SpanHandle
+		pipeCtx, span = tracer.StartSpan(parentCtx, spanName, spanKind, attrs...)
+		if ex, ok := ctx.Value(exchangeKey{}).(*proxyExchange); ok && ex != nil {
+			ex.span = span
+		}
+
+		sc := span.SpanContext()
+		if sc.Valid {
+			tracer.InjectContext(pipeCtx, carrier)
+			if tidBytes, err := hex.DecodeString(sc.TraceID); err == nil && len(tidBytes) == 16 {
+				copy(req.TraceContext.TraceID[:], tidBytes)
+			}
+			if sidBytes, err := hex.DecodeString(sc.SpanID); err == nil && len(sidBytes) == 8 {
+				copy(req.TraceContext.ParentID[:], sidBytes)
+			}
+			if extractedSC.Valid {
+				if inSID, err := hex.DecodeString(extractedSC.SpanID); err == nil && len(inSID) == 8 {
+					copy(req.TraceContext.IncomingParentID[:], inSID)
+				}
+			}
+			req.TraceContext.TraceFlags = sc.TraceFlags
+			req.TraceContext.Valid = true
+			req.TraceContext.Incoming = extractedSC.Valid
+			req.TraceContext.Generated = !extractedSC.Valid
+		}
+	}
+
 	if b.trace != nil {
-		if err := b.trace.OnRequest(ctx, conn, req); err != nil {
+		if err := b.trace.OnRequest(pipeCtx, conn, req); err != nil {
 			return err
 		}
 	}
@@ -398,7 +614,7 @@ func (b *Bridge) runRequestPipeline(ctx context.Context, conn *model.ConnectionM
 	authzIc := b.authz
 	b.authzMu.RUnlock()
 	if authzIc != nil {
-		if err := authzIc.OnRequest(ctx, conn, req); err != nil {
+		if err := authzIc.OnRequest(pipeCtx, conn, req); err != nil {
 			return err
 		}
 	}
@@ -408,12 +624,12 @@ func (b *Bridge) runRequestPipeline(ctx context.Context, conn *model.ConnectionM
 		}
 	}
 	if b.rules != nil {
-		if err := b.rules.OnRequest(ctx, conn, req); err != nil {
+		if err := b.rules.OnRequest(pipeCtx, conn, req); err != nil {
 			return err
 		}
 	}
 	for _, ic := range b.custom {
-		if err := ic.OnRequest(ctx, conn, req); err != nil {
+		if err := ic.OnRequest(pipeCtx, conn, req); err != nil {
 			return err
 		}
 	}
@@ -459,6 +675,106 @@ func (b *Bridge) completeExchange(ctx context.Context, conn *model.ConnectionMet
 		}
 	}
 
+	metrics, _ := b.telemetryRecorders()
+	if metrics != nil && conn != nil {
+		srcSvc, srcNS := model.ParseCallerService(conn.CallerIdentity)
+		destSvc, destNS := formatBridgeDestLabels(*conn)
+
+		metrics.AddUpDownCounter(context.Background(), outbound.MetricRequestsActive, -1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+		)
+
+		isGRPC := isExchangeGRPC(conn, ex)
+		protoLabel := protocolMetricLabel(*conn, isGRPC)
+		grpcStatus := extractGRPCStatus(ex)
+
+		respCode := "error"
+		if isGRPC && grpcStatus != "" {
+			respCode = grpcStatus
+		} else if ex.respCtx.StatusCode > 0 {
+			respCode = strconv.Itoa(ex.respCtx.StatusCode)
+		}
+
+		durMs := float64(ex.respCtx.Duration.Nanoseconds()) / 1e6
+		if metrics.CombinedRequestMetricEnabled() {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrSourceNamespace, Value: srcNS},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: protoLabel},
+				model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: respCode},
+			)
+		}
+		if conn.Direction == model.DirectionInbound {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsIngressTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrSourceNamespace, Value: srcNS},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: protoLabel},
+				model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: respCode},
+			)
+		} else {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsEgressTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: protoLabel},
+				model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: respCode},
+			)
+		}
+		metrics.RecordHistogram(context.Background(), outbound.MetricRequestsDurationMs, durMs,
+			model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: protoLabel},
+		)
+		if bytesIn > 0 {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesSent, bytesIn,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			)
+		}
+		if bytesOut > 0 {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesReceived, bytesOut,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			)
+		}
+	}
+
+	if ex.span != nil {
+		isGRPC := conn != nil && isExchangeGRPC(conn, ex)
+		grpcStatus := extractGRPCStatus(ex)
+		if ex.respCtx.StatusCode > 0 {
+			ex.span.SetAttributes(model.MetricAttribute{
+				Key:   outbound.AttrHTTPStatusCode,
+				Value: strconv.Itoa(ex.respCtx.StatusCode),
+			})
+		}
+		if isGRPC && grpcStatus != "" {
+			ex.span.SetAttributes(model.MetricAttribute{
+				Key:   outbound.AttrRPCGRPCStatusCode,
+				Value: grpcStatus,
+			})
+		}
+
+		isErr := (ex.err != nil && ex.rejected == nil) ||
+			ex.respCtx.StatusCode >= 500 ||
+			ex.respCtx.StatusCode == http.StatusForbidden ||
+			(isGRPC && grpcStatus != "" && grpcStatus != "0")
+		if isErr {
+			desc := ""
+			if ex.err != nil {
+				desc = ex.err.Error()
+			} else if isGRPC && grpcStatus != "" && grpcStatus != "0" {
+				desc = "grpc status " + grpcStatus
+			} else {
+				desc = "http status " + strconv.Itoa(ex.respCtx.StatusCode)
+			}
+			ex.span.SetError(ex.err, desc)
+		}
+		ex.span.End()
+	}
+
 	if ex.reqCtx != nil {
 		path := ""
 		if ex.reqCtx.URL != nil {
@@ -482,6 +798,72 @@ func (b *Bridge) completeExchange(ctx context.Context, conn *model.ConnectionMet
 			conn.NodeServiceID,
 		)
 	}
+}
+
+func formatBridgeDestLabels(conn model.ConnectionMeta) (service, namespace string) {
+	namespace = strings.TrimSpace(conn.Namespace)
+	if namespace == "" {
+		namespace = "unknown"
+	}
+	name := strings.TrimSpace(conn.ServiceName)
+	if name == "" {
+		name = strings.TrimSpace(conn.NodeServiceID)
+	}
+	if name == "" {
+		return "unknown", namespace
+	}
+	if conn.Namespace != "" && conn.ServiceName != "" {
+		return conn.Namespace + "/" + conn.ServiceName, namespace
+	}
+	return name, namespace
+}
+
+func isExchangeGRPC(conn *model.ConnectionMeta, ex *proxyExchange) bool {
+	if conn != nil && strings.EqualFold(strings.TrimSpace(conn.RawProtocol), "grpc") {
+		return true
+	}
+	if ex != nil && ex.reqCtx != nil && ex.reqCtx.Headers != nil {
+		if isGRPCContentType(ex.reqCtx.Headers.Get("Content-Type")) {
+			return true
+		}
+	}
+	if ex != nil && ex.respCtx != nil && ex.respCtx.Headers != nil {
+		if isGRPCContentType(ex.respCtx.Headers.Get("Content-Type")) {
+			return true
+		}
+	}
+	return false
+}
+
+func protocolMetricLabel(conn model.ConnectionMeta, isGRPC bool) string {
+	if isGRPC {
+		return "grpc"
+	}
+	switch conn.DetectedProto {
+	case model.ProtocolHTTP2:
+		return "http2"
+	case model.ProtocolHTTP1:
+		return "http1"
+	default:
+		return "tcp"
+	}
+}
+
+func extractGRPCStatus(ex *proxyExchange) string {
+	if ex == nil || ex.respCtx == nil {
+		return ""
+	}
+	if ex.respCtx.Trailers != nil {
+		if v := ex.respCtx.Trailers.Get("Grpc-Status"); v != "" {
+			return v
+		}
+	}
+	if ex.respCtx.Headers != nil {
+		if v := ex.respCtx.Headers.Get("Grpc-Status"); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func restoreForwardedHeaders(in, out http.Header) {

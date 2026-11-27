@@ -13,6 +13,7 @@ import (
 
 	omnimeshv1 "github.com/esachser/omnimeshcontrol/api/gen/omnimesh/v1"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
+	"github.com/esachser/omnimeshdp/internal/port/outbound"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -28,6 +29,7 @@ type HealthChecker struct {
 	mu        sync.Mutex
 	probers   map[string]*serviceProber
 	onStatus  HealthStatusCallback
+	metrics   outbound.MetricRecorder
 	closed    bool
 	tcpDialer *net.Dialer
 	client    *http.Client
@@ -55,6 +57,16 @@ func NewHealthChecker(onStatus HealthStatusCallback) *HealthChecker {
 			Timeout: 5 * time.Second,
 		},
 	}
+}
+
+// SetMetrics configures an optional MetricRecorder for health probe and transition metrics.
+func (h *HealthChecker) SetMetrics(metrics outbound.MetricRecorder) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.metrics = metrics
 }
 
 // StartService starts or updates a health check worker for the given service.
@@ -154,10 +166,16 @@ func (h *HealthChecker) runProber(ctx context.Context, p *serviceProber) {
 		targetAddr = p.svc.Address()
 	}
 
+	svcLabel := p.svc.Name
+	if p.svc.Namespace != "" && p.svc.Name != "" {
+		svcLabel = p.svc.Namespace + "/" + p.svc.Name
+	}
+
 	executeProbe := func() {
 		probeCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
+		probeStart := time.Now()
 		var err error
 		switch probeType {
 		case "HTTP":
@@ -167,6 +185,7 @@ func (h *HealthChecker) runProber(ctx context.Context, p *serviceProber) {
 		default: // TCP
 			err = h.probeTCP(probeCtx, targetAddr)
 		}
+		probeDurationMs := float64(time.Since(probeStart).Nanoseconds()) / 1e6
 
 		h.mu.Lock()
 		if ctx.Err() != nil {
@@ -174,6 +193,8 @@ func (h *HealthChecker) runProber(ctx context.Context, p *serviceProber) {
 			return
 		}
 
+		metrics := h.metrics
+		prevStatus := p.currentStatus
 		var changed bool
 		var newStatus omnimeshv1.EndpointHealthStatus
 
@@ -213,6 +234,31 @@ func (h *HealthChecker) runProber(ctx context.Context, p *serviceProber) {
 			}
 		}
 		h.mu.Unlock()
+
+		if metrics != nil {
+			resultLabel := "success"
+			if err != nil {
+				resultLabel = "failure"
+			}
+			metrics.AddCounter(ctx, outbound.MetricHealthProbesTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrService, Value: svcLabel},
+				model.MetricAttribute{Key: outbound.MetricAttrEndpoint, Value: targetAddr},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: probeType},
+				model.MetricAttribute{Key: outbound.MetricAttrResult, Value: resultLabel},
+			)
+			metrics.RecordHistogram(ctx, outbound.MetricHealthProbesDurationMs, probeDurationMs,
+				model.MetricAttribute{Key: outbound.MetricAttrService, Value: svcLabel},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: probeType},
+			)
+			if changed {
+				metrics.AddCounter(ctx, outbound.MetricHealthTransitions, 1,
+					model.MetricAttribute{Key: outbound.MetricAttrService, Value: svcLabel},
+					model.MetricAttribute{Key: outbound.MetricAttrEndpoint, Value: targetAddr},
+					model.MetricAttribute{Key: outbound.MetricAttrFromState, Value: healthStatusLabel(prevStatus)},
+					model.MetricAttribute{Key: outbound.MetricAttrToState, Value: healthStatusLabel(newStatus)},
+				)
+			}
+		}
 
 		if changed && cb != nil && report != nil {
 			cb(p.svc, report)
@@ -324,5 +370,18 @@ func (h *HealthChecker) Close() {
 		<-p.done
 	}
 	log.Println("[HealthChecker] All health probers stopped.")
+}
+
+func healthStatusLabel(st omnimeshv1.EndpointHealthStatus) string {
+	switch st {
+	case omnimeshv1.EndpointHealthStatus_ENDPOINT_HEALTH_STATUS_HEALTHY:
+		return "healthy"
+	case omnimeshv1.EndpointHealthStatus_ENDPOINT_HEALTH_STATUS_UNHEALTHY:
+		return "unhealthy"
+	case omnimeshv1.EndpointHealthStatus_ENDPOINT_HEALTH_STATUS_DRAINING:
+		return "draining"
+	default:
+		return "unspecified"
+	}
 }
 

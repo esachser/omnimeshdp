@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/esachser/omnimeshdp/internal/adapter/sockmark"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/inbound"
+	"github.com/esachser/omnimeshdp/internal/port/outbound"
 )
 
 // Server implements an HTTP/2 HBONE (CONNECT) tunnel server.
@@ -31,6 +33,10 @@ type Server struct {
 	nodeID       string
 	httpBridge   inbound.HTTPStreamBridge
 	authorizer   inbound.Authorizer
+	telemetry    outbound.TelemetryProvider
+
+	pendingTLS    sync.Map // net.Conn -> time.Time
+	activeTunnels sync.Map // net.Conn -> string (peer_node)
 }
 
 // NewServer creates a new HBONE server listening on the specified address.
@@ -52,9 +58,76 @@ func NewServer(addr string, tlsConfig ...*tls.Config) *Server {
 		HTTP2:       &http.HTTP2Config{},
 		Protocols:   serverProtocols(s.tlsConfig != nil),
 		TLSConfig:   s.tlsConfig,
+		ConnState:   s.onConnState,
 	}
 
 	return s
+}
+
+// SetTelemetry configures the TelemetryProvider used for inbound HBONE metrics, mTLS metrics, and tracing.
+func (s *Server) SetTelemetry(tp outbound.TelemetryProvider) {
+	if s == nil {
+		return
+	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.telemetry = tp
+}
+
+func (s *Server) telemetryRecorders() (outbound.MetricRecorder, outbound.TraceRecorder) {
+	if s == nil {
+		return nil, nil
+	}
+	s.cfgMu.RLock()
+	tp := s.telemetry
+	s.cfgMu.RUnlock()
+	if tp == nil {
+		return nil, nil
+	}
+	return tp.Metrics(), tp.Tracer()
+}
+
+func (s *Server) onConnState(conn net.Conn, state http.ConnState) {
+	metrics, _ := s.telemetryRecorders()
+	switch state {
+	case http.StateNew:
+		if metrics != nil {
+			peerHost := hostOnly(conn.RemoteAddr().String())
+			if peerHost == "" {
+				peerHost = "unknown"
+			}
+			s.activeTunnels.Store(conn, peerHost)
+			metrics.AddUpDownCounter(context.Background(), outbound.MetricHBONETunnelsActive, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: peerHost},
+				model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+			)
+		}
+	case http.StateClosed, http.StateHijacked:
+		pendingKey := conn
+		if tc, ok := conn.(*tls.Conn); ok {
+			pendingKey = tc.NetConn()
+		}
+		if startRaw, ok := s.pendingTLS.LoadAndDelete(pendingKey); ok && metrics != nil {
+			if start, ok := startRaw.(time.Time); ok {
+				durMs := float64(time.Since(start).Nanoseconds()) / 1e6
+				metrics.AddCounter(context.Background(), outbound.MetricMTLSHandshakesTotal, 1,
+					model.MetricAttribute{Key: outbound.MetricAttrPeerService, Value: "unknown"},
+					model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+					model.MetricAttribute{Key: outbound.MetricAttrResult, Value: "failure"},
+				)
+				metrics.RecordHistogram(context.Background(), outbound.MetricMTLSHandshakesDurationMs, durMs,
+					model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+				)
+			}
+		}
+		if peerRaw, ok := s.activeTunnels.LoadAndDelete(conn); ok && metrics != nil {
+			peerHost, _ := peerRaw.(string)
+			metrics.AddUpDownCounter(context.Background(), outbound.MetricHBONETunnelsActive, -1,
+				model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: peerHost},
+				model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+			)
+		}
+	}
 }
 
 func serverProtocols(useTLS bool) *http.Protocols {
@@ -188,9 +261,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		if !slices.Contains(s.tlsConfig.NextProtos, "h2") {
 			s.tlsConfig.NextProtos = append([]string{"h2"}, s.tlsConfig.NextProtos...)
 		}
-		s.httpServer.TLSConfig = s.tlsConfig
+		instrumentedTLS := s.wrapTLSConfigForMetrics(s.tlsConfig)
+		s.httpServer.TLSConfig = instrumentedTLS
 		s.httpServer.Protocols = serverProtocols(true)
-		ln = tls.NewListener(ln, s.tlsConfig)
+		ln = tls.NewListener(ln, instrumentedTLS)
 	}
 
 	log.Printf("Proxy HBONE server running on %s (tls=%v)...\n", ln.Addr().String(), s.tlsConfig != nil)
@@ -214,9 +288,121 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
+func (s *Server) wrapTLSConfigForMetrics(base *tls.Config) *tls.Config {
+	cloned := base.Clone()
+	origGetConfig := cloned.GetConfigForClient
+	origVerify := cloned.VerifyConnection
+
+	recordVerify := func(conn net.Conn, start time.Time, hasStart bool, cs tls.ConnectionState) error {
+		var err error
+		if origVerify != nil {
+			err = origVerify(cs)
+		}
+		if conn != nil {
+			if prev, ok := s.pendingTLS.LoadAndDelete(conn); ok && !hasStart {
+				if t, ok := prev.(time.Time); ok {
+					start = t
+					hasStart = true
+				}
+			}
+		}
+		if metrics, _ := s.telemetryRecorders(); metrics != nil {
+			var durMs float64
+			if hasStart {
+				durMs = float64(time.Since(start).Nanoseconds()) / 1e6
+			}
+			result := "success"
+			if err != nil {
+				result = "failure"
+			}
+			peerSvc := extractPeerServiceFromState(cs)
+			metrics.AddCounter(context.Background(), outbound.MetricMTLSHandshakesTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrPeerService, Value: peerSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+				model.MetricAttribute{Key: outbound.MetricAttrResult, Value: result},
+			)
+			metrics.RecordHistogram(context.Background(), outbound.MetricMTLSHandshakesDurationMs, durMs,
+				model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+			)
+		}
+		return err
+	}
+
+	cloned.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		start := time.Now()
+		var conn net.Conn
+		if hello != nil {
+			conn = hello.Conn
+			if conn != nil {
+				s.pendingTLS.Store(conn, start)
+			}
+		}
+
+		targetCfg := cloned
+		if origGetConfig != nil {
+			customCfg, err := origGetConfig(hello)
+			if err != nil {
+				return nil, err
+			}
+			if customCfg != nil {
+				targetCfg = customCfg
+			}
+		}
+
+		perConn := targetCfg.Clone()
+		perConn.GetConfigForClient = nil
+		customVerify := targetCfg.VerifyConnection
+		perConn.VerifyConnection = func(cs tls.ConnectionState) error {
+			if customVerify != nil && origGetConfig != nil {
+				var err error
+				err = customVerify(cs)
+				if conn != nil {
+					s.pendingTLS.Delete(conn)
+				}
+				if metrics, _ := s.telemetryRecorders(); metrics != nil {
+					result := "success"
+					if err != nil {
+						result = "failure"
+					}
+					peerSvc := extractPeerServiceFromState(cs)
+					metrics.AddCounter(context.Background(), outbound.MetricMTLSHandshakesTotal, 1,
+						model.MetricAttribute{Key: outbound.MetricAttrPeerService, Value: peerSvc},
+						model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+						model.MetricAttribute{Key: outbound.MetricAttrResult, Value: result},
+					)
+					metrics.RecordHistogram(context.Background(), outbound.MetricMTLSHandshakesDurationMs,
+						float64(time.Since(start).Nanoseconds())/1e6,
+						model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+					)
+				}
+				return err
+			}
+			return recordVerify(conn, start, true, cs)
+		}
+		return perConn, nil
+	}
+
+	cloned.VerifyConnection = func(cs tls.ConnectionState) error {
+		return recordVerify(nil, time.Time{}, false, cs)
+	}
+
+	return cloned
+}
+
 // ServeHTTP handles incoming HTTP/2 requests, expecting CONNECT with x-omnimesh-service-id or x-omnimesh-real-dest.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	metrics, tracer := s.telemetryRecorders()
+	connStart := time.Now()
+
 	if r.Method != http.MethodConnect {
+		if metrics != nil {
+			metrics.AddCounter(r.Context(), outbound.MetricHBONEStreamsTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: "unknown"},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: "unknown"},
+				model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+				model.MetricAttribute{Key: outbound.MetricAttrResult, Value: "error"},
+			)
+		}
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -237,6 +423,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if destAddr == "" {
+		if metrics != nil {
+			metrics.AddCounter(r.Context(), outbound.MetricHBONEStreamsTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: defaultStr(sourceNodeID, "unknown")},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: defaultStr(nodeServiceID, "unknown")},
+				model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+				model.MetricAttribute{Key: outbound.MetricAttrResult, Value: "error"},
+			)
+		}
 		http.Error(w, "Missing x-omnimesh-real-dest or resolvable x-omnimesh-node-service-id header", http.StatusBadRequest)
 		return
 	}
@@ -292,12 +486,82 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		inboundL7Available = true
 	}
 
-	authzRequiresL7 := false
+	peerNode := sourceNodeID
+	if peerNode == "" {
+		peerNode = defaultStr(hostOnly(r.RemoteAddr), "unknown")
+	}
+	srcSvc, srcNS := model.ParseCallerService(callerIdentity)
 	resolvedNS := resolvedSvc.Namespace
 	resolvedName := resolvedSvc.Name
 	resolvedProto := resolvedSvc.Protocol
+
+	destSvcLabel := formatServiceLabel(resolvedNS, resolvedName, nodeServiceID, destAddr)
+	destNSLabel := defaultStr(resolvedNS, "unknown")
+
+	reqCtx := r.Context()
+	if tracer != nil {
+		reqCtx = tracer.ExtractContext(reqCtx, outbound.HTTPHeaderCarrier(r.Header))
+	}
+
+	var span outbound.SpanHandle = outbound.NoopSpanHandle{}
+	if tracer != nil {
+		spanAttrs := []model.MetricAttribute{
+			{Key: outbound.AttrDirection, Value: "ingress"},
+			{Key: outbound.AttrNode, Value: nodeID},
+			{Key: outbound.AttrSourceService, Value: srcSvc},
+			{Key: outbound.AttrSourceNamespace, Value: srcNS},
+			{Key: outbound.AttrDestinationService, Value: defaultStr(resolvedName, destSvcLabel)},
+			{Key: outbound.AttrDestinationNamespace, Value: destNSLabel},
+			{Key: outbound.AttrDestinationEndpoint, Value: destAddr},
+			{Key: outbound.AttrProtocol, Value: defaultStr(strings.ToLower(strings.TrimSpace(resolvedProto)), "tcp")},
+		}
+		reqCtx, span = tracer.StartSpan(reqCtx, outbound.SpanNameIngress, model.SpanKindServer, spanAttrs...)
+	}
+
+	if metrics != nil {
+		metrics.AddUpDownCounter(reqCtx, outbound.MetricHBONEStreamsActive, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: peerNode},
+			model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+		)
+		defer metrics.AddUpDownCounter(context.Background(), outbound.MetricHBONEStreamsActive, -1,
+			model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: peerNode},
+			model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+		)
+		metrics.AddUpDownCounter(reqCtx, outbound.MetricConnectionsActive, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNSLabel},
+		)
+		defer metrics.AddUpDownCounter(context.Background(), outbound.MetricConnectionsActive, -1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNSLabel},
+		)
+	}
+
+	recordOutcome := func(result string) {
+		if metrics == nil {
+			return
+		}
+		metrics.AddCounter(context.Background(), outbound.MetricHBONEStreamsTotal, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: peerNode},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+			model.MetricAttribute{Key: outbound.MetricAttrResult, Value: result},
+		)
+		metrics.AddCounter(context.Background(), outbound.MetricConnectionsTotal, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNSLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+			model.MetricAttribute{Key: outbound.MetricAttrResult, Value: result},
+		)
+		metrics.RecordHistogram(context.Background(), outbound.MetricConnectionsDurationMs,
+			float64(time.Since(connStart).Nanoseconds())/1e6,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+		)
+	}
+
+	authzRequiresL7 := false
 	if authorizer != nil {
-		decision := authorizer.AuthorizeConnection(r.Context(), model.AuthzRequest{
+		decision := authorizer.AuthorizeConnection(reqCtx, model.AuthzRequest{
 			Layer:              model.AuthzLayerL4,
 			CallerIdentity:     callerIdentity,
 			CallerVerified:     callerVerified,
@@ -313,6 +577,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			InboundL7Available: inboundL7Available,
 		})
 		if !decision.Allowed {
+			recordOutcome("forbidden")
+			span.SetAttributes(model.MetricAttribute{Key: outbound.AttrHTTPStatusCode, Value: "403"})
+			span.SetError(nil, "forbidden by authorization policy")
+			span.End()
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -326,6 +594,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if resolvedProto == "" {
 			resolvedProto = decision.ResolvedProtocol
 		}
+		if resolvedName != "" {
+			destSvcLabel = formatServiceLabel(resolvedNS, resolvedName, nodeServiceID, destAddr)
+			destNSLabel = defaultStr(resolvedNS, "unknown")
+			span.SetAttributes(
+				model.MetricAttribute{Key: outbound.AttrDestinationService, Value: resolvedName},
+				model.MetricAttribute{Key: outbound.AttrDestinationNamespace, Value: destNSLabel},
+			)
+		}
 	}
 
 	// Dial target real destination. The socket is marked so Linux redirect rules
@@ -334,6 +610,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	targetConn, err := dialer.Dial("tcp", destAddr)
 	if err != nil {
 		log.Printf("Failed to connect to destination at %s (nodeServiceID=%q): %v\n", destAddr, nodeServiceID, err)
+		recordOutcome("bad_gateway")
+		span.SetAttributes(model.MetricAttribute{Key: outbound.AttrHTTPStatusCode, Value: "502"})
+		span.SetError(err, "failed to dial local service")
+		span.End()
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
@@ -345,12 +625,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
+	var trackedBody io.ReadCloser = r.Body
+	var trackedWriter io.Writer = w
+	if metrics != nil {
+		trackedBody = &trackedReadCloser{
+			rc: r.Body,
+			onRead: func(n int) {
+				metrics.AddCounter(context.Background(), outbound.MetricHBONEBytesReceived, int64(n),
+					model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: peerNode},
+					model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+				)
+			},
+		}
+		trackedWriter = &countingWriter{
+			w: w,
+			onWrite: func(n int) {
+				metrics.AddCounter(context.Background(), outbound.MetricHBONEBytesSent, int64(n),
+					model.MetricAttribute{Key: outbound.MetricAttrPeerNode, Value: peerNode},
+					model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "ingress"},
+				)
+			},
+		}
+	}
+
 	if httpBridge != nil {
 		var localAddr net.Addr
 		if s.listener != nil {
 			localAddr = s.listener.Addr()
 		}
-		hboneConn := newHBONEStreamConn(r.Body, w, flusher, r.RemoteAddr, localAddr)
+		hboneConn := newHBONEStreamConn(trackedBody, trackedWriter, flusher, r.RemoteAddr, localAddr)
 		defer hboneConn.Close()
 
 		svcID := resolvedSvc.ID
@@ -374,19 +677,34 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ServiceLabels:   resolvedSvc.Labels,
 			AuthzRequiresL7: authzRequiresL7,
 		}
-		if err := httpBridge.Bridge(r.Context(), hboneConn, targetConn, meta); err != nil {
-			log.Printf("Inbound HTTP bridge error for %s: %v\n", destAddr, err)
+		bridgeErr := httpBridge.Bridge(reqCtx, hboneConn, targetConn, meta)
+		if bridgeErr != nil {
+			log.Printf("Inbound HTTP bridge error for %s: %v\n", destAddr, bridgeErr)
+			recordOutcome("error")
+			span.SetError(bridgeErr, bridgeErr.Error())
+		} else {
+			recordOutcome("success")
 		}
+		span.End()
 		return
 	}
 
+	// Raw L4 fallback when HTTP bridge is not configured
+	if metrics != nil {
+		metrics.AddUpDownCounter(reqCtx, outbound.MetricRequestsActive, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNSLabel},
+		)
+	}
+
+	var bytesIn, bytesOut int64
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	// Stream from client to target
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(targetConn, r.Body)
+		bytesIn, _ = io.Copy(targetConn, trackedBody)
 		if tc, ok := targetConn.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -395,11 +713,54 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Stream from target to client
 	go func() {
 		defer wg.Done()
-		fw := &flushWriter{w: w, f: flusher}
-		_, _ = io.Copy(fw, targetConn)
+		fw := &flushWriter{w: trackedWriter, f: flusher}
+		bytesOut, _ = io.Copy(fw, targetConn)
 	}()
 
 	wg.Wait()
+
+	if metrics != nil {
+		metrics.AddUpDownCounter(context.Background(), outbound.MetricRequestsActive, -1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNSLabel},
+		)
+		durMs := float64(time.Since(connStart).Nanoseconds()) / 1e6
+		if metrics.CombinedRequestMetricEnabled() {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrSourceNamespace, Value: srcNS},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNSLabel},
+				model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+				model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: "ok"},
+			)
+		}
+		metrics.AddCounter(context.Background(), outbound.MetricRequestsIngressTotal, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrSourceNamespace, Value: srcNS},
+			model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+			model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: "ok"},
+		)
+		metrics.RecordHistogram(context.Background(), outbound.MetricRequestsDurationMs, durMs,
+			model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+		)
+		if bytesIn > 0 {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesSent, bytesIn,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			)
+		}
+		if bytesOut > 0 {
+			metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesReceived, bytesOut,
+				model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvcLabel},
+			)
+		}
+	}
+	recordOutcome("success")
+	span.End()
 }
 
 type flushWriter struct {
@@ -419,7 +780,7 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 // into a thread-safe net.Conn for the shared L7 HTTPStreamBridge.
 type hboneStreamConn struct {
 	reader     *deadlineReader
-	w          http.ResponseWriter
+	w          io.Writer
 	flusher    http.Flusher
 	remoteAddr net.Addr
 	localAddr  net.Addr
@@ -428,7 +789,7 @@ type hboneStreamConn struct {
 	closed  bool
 }
 
-func newHBONEStreamConn(body io.ReadCloser, w http.ResponseWriter, flusher http.Flusher, remoteAddr string, localAddr net.Addr) *hboneStreamConn {
+func newHBONEStreamConn(body io.ReadCloser, w io.Writer, flusher http.Flusher, remoteAddr string, localAddr net.Addr) *hboneStreamConn {
 	var rAddr net.Addr = hboneAddr{addr: remoteAddr}
 	if parsed, err := net.ResolveTCPAddr("tcp", remoteAddr); err == nil {
 		rAddr = parsed
@@ -492,4 +853,49 @@ func parseHostPort(addr string) (string, int) {
 		return host, 0
 	}
 	return host, port
+}
+
+type trackedReadCloser struct {
+	rc     io.ReadCloser
+	onRead func(int)
+}
+
+func (t *trackedReadCloser) Read(p []byte) (int, error) {
+	n, err := t.rc.Read(p)
+	if n > 0 && t.onRead != nil {
+		t.onRead(n)
+	}
+	return n, err
+}
+
+func (t *trackedReadCloser) Close() error {
+	return t.rc.Close()
+}
+
+func hostOnly(addr string) string {
+	host, _ := parseHostPort(addr)
+	return host
+}
+
+func defaultStr(val, fallback string) string {
+	if val != "" {
+		return val
+	}
+	return fallback
+}
+
+func formatServiceLabel(ns, name, svcID, addr string) string {
+	if ns != "" && name != "" {
+		return ns + "/" + name
+	}
+	if name != "" {
+		return name
+	}
+	if svcID != "" {
+		return svcID
+	}
+	if addr != "" {
+		return addr
+	}
+	return "unknown"
 }

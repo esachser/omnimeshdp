@@ -374,6 +374,7 @@ type AuthzDecision struct {
 	ResolvedDestNamespace   string
 	ResolvedDestServiceName string
 	ResolvedProtocol        string
+	EvaluationDuration      time.Duration
 }
 
 // AuthzStats is a point-in-time snapshot of authorization engine counters.

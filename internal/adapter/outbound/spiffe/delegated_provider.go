@@ -23,6 +23,7 @@ var _ outbound.WorkloadSVIDProvider = (*DelegatedWorkloadProvider)(nil)
 type cachedSVID struct {
 	svid      *x509svid.SVID
 	expiresAt time.Time
+	serial    string
 }
 
 // DelegatedWorkloadProvider retrieves workload SVIDs and mTLS configs from the SPIRE Agent Delegated Identity API.
@@ -33,6 +34,7 @@ type DelegatedWorkloadProvider struct {
 	trustDomain  spiffeid.TrustDomain
 	cache        map[uint64]*cachedSVID
 	cacheMu      sync.RWMutex
+	metrics      outbound.MetricRecorder
 }
 
 // NewDelegatedWorkloadProvider connects to the SPIRE Agent Delegated Identity API endpoint.
@@ -101,6 +103,16 @@ func NewDelegatedWorkloadProviderWithClient(
 	}
 }
 
+// SetMetrics configures an optional MetricRecorder for emitting SVID expiry and rotation metrics.
+func (p *DelegatedWorkloadProvider) SetMetrics(metrics outbound.MetricRecorder) {
+	if p == nil {
+		return
+	}
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+	p.metrics = metrics
+}
+
 // GetClientTLSConfigByPID queries the SPIRE Agent Delegated Identity API for the SVID corresponding to the PID,
 // and returns a *tls.Config ready for mTLS client connection along with the SPIFFE ID string.
 func (p *DelegatedWorkloadProvider) GetClientTLSConfigByPID(ctx context.Context, pid uint64) (*tls.Config, string, error) {
@@ -112,11 +124,16 @@ func (p *DelegatedWorkloadProvider) GetClientTLSConfigByPID(ctx context.Context,
 
 	p.cacheMu.RLock()
 	cached, ok := p.cache[pid]
+	metrics := p.metrics
 	p.cacheMu.RUnlock()
 
 	var svid *x509svid.SVID
-	if ok && cached != nil && now.Before(cached.expiresAt) {
-		svid = cached.svid
+	var prevSerial string
+	if ok && cached != nil {
+		prevSerial = cached.serial
+		if now.Before(cached.expiresAt) {
+			svid = cached.svid
+		}
 	}
 
 	if svid == nil {
@@ -164,12 +181,33 @@ func (p *DelegatedWorkloadProvider) GetClientTLSConfigByPID(ctx context.Context,
 		svid = parsedSVID
 
 		expiresAt := time.Unix(svidWithKey.GetX509Svid().GetExpiresAt(), 0)
+		var newSerial string
+		if len(svid.Certificates) > 0 && svid.Certificates[0].SerialNumber != nil {
+			newSerial = svid.Certificates[0].SerialNumber.String()
+		}
+		if metrics != nil {
+			spiffeID := svid.ID.String()
+			expirySec := time.Until(expiresAt).Seconds()
+			if expirySec < 0 {
+				expirySec = 0
+			}
+			metrics.RecordGauge(ctx, outbound.MetricMTLSSVIDExpirySeconds, expirySec,
+				outbound.MetricAttrSPIFFEIDAttr(spiffeID),
+			)
+			if prevSerial != "" && newSerial != "" && prevSerial != newSerial {
+				metrics.AddCounter(ctx, outbound.MetricMTLSSVIDRotationsTotal, 1,
+					outbound.MetricAttrSPIFFEIDAttr(spiffeID),
+				)
+			}
+		}
+
 		cacheExpiry := expiresAt.Add(-30 * time.Second)
 		if cacheExpiry.After(now) {
 			p.cacheMu.Lock()
 			p.cache[pid] = &cachedSVID{
 				svid:      svid,
 				expiresAt: cacheExpiry,
+				serial:    newSerial,
 			}
 			p.cacheMu.Unlock()
 		}

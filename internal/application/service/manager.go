@@ -9,6 +9,7 @@ import (
 	omnimeshv1 "github.com/esachser/omnimeshcontrol/api/gen/omnimesh/v1"
 	"github.com/esachser/omnimeshdp/internal/application/agent"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
+	"github.com/esachser/omnimeshdp/internal/port/outbound"
 )
 
 // ManagerConfig configures the service manager.
@@ -16,6 +17,7 @@ type ManagerConfig struct {
 	ServicesDir       string
 	InitialServices   []model.NodeServiceInfo
 	ControlPlaneAgent *agent.ControlPlaneAgent
+	Metrics           outbound.MetricRecorder
 	OnServicesChange  func(added, removed []model.NodeServiceInfo)
 	OnHealthChange    func(svc model.NodeServiceInfo, report *omnimeshv1.HealthReport)
 }
@@ -60,6 +62,9 @@ func (m *Manager) Start(ctx context.Context) error {
 			m.config.OnHealthChange(svc, report)
 		}
 	})
+	if m.config.Metrics != nil {
+		m.healthChecker.SetMetrics(m.config.Metrics)
+	}
 
 	// 2. Start health checking for initial services
 	for _, svc := range m.config.InitialServices {

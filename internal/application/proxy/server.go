@@ -8,6 +8,7 @@ import (
 	"github.com/esachser/omnimeshdp/internal/adapter/inbound/hbone"
 	"github.com/esachser/omnimeshdp/internal/domain/model"
 	"github.com/esachser/omnimeshdp/internal/port/inbound"
+	"github.com/esachser/omnimeshdp/internal/port/outbound"
 )
 
 var _ inbound.ProxyService = (*ServerSideService)(nil)
@@ -56,6 +57,11 @@ func (s *ServerSideService) SetHTTPBridge(bridge inbound.HTTPStreamBridge) {
 // SetAuthorizer configures an inbound Authorizer evaluated on incoming HBONE connections.
 func (s *ServerSideService) SetAuthorizer(authorizer inbound.Authorizer) {
 	s.server.SetAuthorizer(authorizer)
+}
+
+// SetTelemetry configures the TelemetryProvider used for inbound HBONE metrics and tracing.
+func (s *ServerSideService) SetTelemetry(tp outbound.TelemetryProvider) {
+	s.server.SetTelemetry(tp)
 }
 
 // Start runs the HBONE server until context cancellation.

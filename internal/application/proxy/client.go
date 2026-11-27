@@ -10,7 +10,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,6 +37,7 @@ type ClientSideService struct {
 	router          *Router
 	svidProvider    outbound.WorkloadSVIDProvider
 	httpBridge      inbound.HTTPStreamBridge
+	telemetry       outbound.TelemetryProvider
 	defaultRetry    model.RetryConfig
 }
 
@@ -108,6 +112,17 @@ func (s *ClientSideService) SetHTTPBridge(bridge inbound.HTTPStreamBridge) {
 	s.httpBridge = bridge
 }
 
+// SetTelemetry configures the TelemetryProvider for outbound connections, retries, HBONE, and tracing.
+func (s *ClientSideService) SetTelemetry(tp outbound.TelemetryProvider) {
+	s.mu.Lock()
+	s.telemetry = tp
+	hc := s.hboneClient
+	s.mu.Unlock()
+	if hc != nil {
+		hc.SetTelemetry(tp)
+	}
+}
+
 // WorkloadSVIDProvider returns the active WorkloadSVIDProvider, or nil if none is configured.
 func (s *ClientSideService) WorkloadSVIDProvider() outbound.WorkloadSVIDProvider {
 	s.mu.RLock()
@@ -177,6 +192,7 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 	defaultRetry := s.defaultRetry
 	nodeID := s.nodeID
 	httpBridge := s.httpBridge
+	telemetry := s.telemetry
 	s.mu.RUnlock()
 
 	var identity string
@@ -211,7 +227,7 @@ func (s *ClientSideService) handleConnection(ctx context.Context, localConn net.
 		return
 	}
 
-	_ = s.tunnelWithRetries(ctx, localConn, router, pktInfo.IP, pktInfo.Port, fallbackHost, nodeID, identity, clientTLS, defaultRetry, httpBridge)
+	_ = s.tunnelWithRetries(ctx, localConn, router, pktInfo.IP, pktInfo.Port, fallbackHost, nodeID, identity, clientTLS, defaultRetry, httpBridge, telemetry)
 }
 
 func (s *ClientSideService) singleTunnel(
@@ -288,10 +304,50 @@ func (s *ClientSideService) tunnelWithRetries(
 	clientTLS *tls.Config,
 	defaultRetry model.RetryConfig,
 	httpBridge inbound.HTTPStreamBridge,
+	telemetry outbound.TelemetryProvider,
 ) error {
+	var metrics outbound.MetricRecorder
+	var tracer outbound.TraceRecorder
+	if telemetry != nil {
+		metrics = telemetry.Metrics()
+		tracer = telemetry.Tracer()
+	}
+
+	connStart := time.Now()
+	srcSvc, srcNS := model.ParseCallerService(identity)
+
+	var activeTracked bool
+	var activeSvc, activeNS string
+	defer func() {
+		if activeTracked && metrics != nil {
+			metrics.AddUpDownCounter(context.Background(), outbound.MetricConnectionsActive, -1,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: activeSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: activeNS},
+			)
+		}
+	}()
+
+	recordConnOutcome := func(destSvc, destNS, result string) {
+		if metrics == nil {
+			return
+		}
+		metrics.AddCounter(context.Background(), outbound.MetricConnectionsTotal, 1,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+			model.MetricAttribute{Key: outbound.MetricAttrDirection, Value: "egress"},
+			model.MetricAttribute{Key: outbound.MetricAttrResult, Value: result},
+		)
+		metrics.RecordHistogram(context.Background(), outbound.MetricConnectionsDurationMs,
+			float64(time.Since(connStart).Nanoseconds())/1e6,
+			model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+		)
+	}
+
 	var excludedBuf [8]model.EndpointKey
 	excluded := excludedBuf[:0]
 	var lastErr error
+	lastDestSvc := "unknown"
+	lastDestNS := "unknown"
 	attempt := 0
 
 	for {
@@ -300,13 +356,38 @@ func (s *ClientSideService) tunnelWithRetries(
 			if attempt == 0 {
 				log.Printf("No route available for %s (caller port %s): %v\n",
 					formatIPv4Port(destIP, destPort), localConn.RemoteAddr().String(), err)
+				recordConnOutcome("unknown", "unknown", "no_route")
 				return err
 			}
+			if metrics != nil {
+				metrics.AddCounter(ctx, outbound.MetricRetriesExhausted, 1,
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: lastDestSvc},
+				)
+			}
+			recordConnOutcome(lastDestSvc, lastDestNS, "error")
 			wrapped := fmt.Errorf("%w after %d attempt(s) (tried=%v): %w",
 				domain.ErrRetriesExhausted, attempt, excluded, lastErr)
 			log.Printf("Routing retries exhausted for %s: %v\n",
 				formatIPv4Port(destIP, destPort), wrapped)
 			return wrapped
+		}
+
+		destSvc := formatServiceAttr(resolved.Namespace, resolved.ServiceName)
+		destNS := resolved.Namespace
+		if destNS == "" {
+			destNS = "unknown"
+		}
+		lastDestSvc = destSvc
+		lastDestNS = destNS
+
+		if !activeTracked && metrics != nil {
+			activeTracked = true
+			activeSvc = destSvc
+			activeNS = destNS
+			metrics.AddUpDownCounter(ctx, outbound.MetricConnectionsActive, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: activeSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: activeNS},
+			)
 		}
 
 		connectTimeout := retryCfg.ConnectTimeout
@@ -319,6 +400,30 @@ func (s *ClientSideService) tunnelWithRetries(
 
 		release := router.AcquireEndpoint(resolved.EndpointKey)
 
+		spanCtx := ctx
+		var span outbound.SpanHandle = outbound.NoopSpanHandle{}
+		if tracer != nil {
+			protoLabel := strings.ToLower(strings.TrimSpace(resolved.Protocol))
+			if protoLabel == "" {
+				protoLabel = "tcp"
+			}
+			destName := resolved.ServiceName
+			if destName == "" {
+				destName = destSvc
+			}
+			spanCtx, span = tracer.StartSpan(ctx, outbound.SpanNameEgress, model.SpanKindClient,
+				model.MetricAttribute{Key: outbound.AttrDirection, Value: "egress"},
+				model.MetricAttribute{Key: outbound.AttrNode, Value: sourceNodeID},
+				model.MetricAttribute{Key: outbound.AttrSourceService, Value: srcSvc},
+				model.MetricAttribute{Key: outbound.AttrSourceNamespace, Value: srcNS},
+				model.MetricAttribute{Key: outbound.AttrDestinationService, Value: destName},
+				model.MetricAttribute{Key: outbound.AttrDestinationNamespace, Value: destNS},
+				model.MetricAttribute{Key: outbound.AttrDestinationEndpoint, Value: resolved.RealDest},
+				model.MetricAttribute{Key: outbound.AttrProtocol, Value: protoLabel},
+				model.MetricAttribute{Key: outbound.AttrRetryAttempt, Value: strconv.Itoa(attempt)},
+			)
+		}
+
 		log.Printf(
 			"Establishing HBONE tunnel to %s with identity %q for caller on port %s (destination: %s, nodeServiceID: %q, attempt=%d, mTLS=%v)\n",
 			resolved.TargetHost,
@@ -330,17 +435,24 @@ func (s *ClientSideService) tunnelWithRetries(
 			clientTLS != nil,
 		)
 
-		tunnel, err := s.hboneClient.OpenTunnelWithOptions(ctx, hbone.TunnelOptions{
+		tunnel, err := s.hboneClient.OpenTunnelWithOptions(spanCtx, hbone.TunnelOptions{
 			ConnectTimeout: connectTimeout,
 			TargetHost:     resolved.TargetHost,
 			RealDest:       resolved.RealDest,
 			NodeServiceID:  resolved.ServiceID,
 			SourceNodeID:   sourceNodeID,
+			DestService:    destSvc,
+			DestNodeID:     resolved.NodeID,
 			Identity:       identity,
 			TLSConfig:      clientTLS,
 		})
 		if err == nil {
 			defer release()
+			if attempt > 0 && metrics != nil {
+				metrics.AddCounter(spanCtx, outbound.MetricRetriesSuccess, 1,
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				)
+			}
 			meta := model.ConnectionMeta{
 				Direction:       model.DirectionOutbound,
 				ConfiguredProto: model.NormalizeProtocol(resolved.Protocol),
@@ -355,20 +467,92 @@ func (s *ClientSideService) tunnelWithRetries(
 				ServiceName:     resolved.ServiceName,
 				NodeServiceID:   resolved.ServiceID,
 			}
-			if bridgeErr := bridgeOutboundTunnel(ctx, httpBridge, tunnel, localConn, meta); bridgeErr != nil {
+
+			var bridgeConn net.Conn = localConn
+			var l4Counter *countingNetConn
+			if httpBridge == nil && metrics != nil {
+				l4Counter = &countingNetConn{Conn: localConn}
+				bridgeConn = l4Counter
+				metrics.AddUpDownCounter(spanCtx, outbound.MetricRequestsActive, 1,
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+				)
+			}
+			l4Start := time.Now()
+			bridgeErr := bridgeOutboundTunnel(spanCtx, httpBridge, tunnel, bridgeConn, meta)
+			if l4Counter != nil && metrics != nil {
+				metrics.AddUpDownCounter(context.Background(), outbound.MetricRequestsActive, -1,
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+				)
+				respCode := "ok"
+				if bridgeErr != nil {
+					respCode = "error"
+				}
+				durMs := float64(time.Since(l4Start).Nanoseconds()) / 1e6
+				if metrics.CombinedRequestMetricEnabled() {
+					metrics.AddCounter(context.Background(), outbound.MetricRequestsTotal, 1,
+						model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+						model.MetricAttribute{Key: outbound.MetricAttrSourceNamespace, Value: srcNS},
+						model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+						model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+						model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+						model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: respCode},
+					)
+				}
+				metrics.AddCounter(context.Background(), outbound.MetricRequestsEgressTotal, 1,
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationNamespace, Value: destNS},
+					model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+					model.MetricAttribute{Key: outbound.MetricAttrResponseCode, Value: respCode},
+				)
+				metrics.RecordHistogram(context.Background(), outbound.MetricRequestsDurationMs, durMs,
+					model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+					model.MetricAttribute{Key: outbound.MetricAttrProtocol, Value: "tcp"},
+				)
+				if sent := l4Counter.bytesRead.Load(); sent > 0 {
+					metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesSent, sent,
+						model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+						model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+					)
+				}
+				if recvd := l4Counter.bytesWritten.Load(); recvd > 0 {
+					metrics.AddCounter(context.Background(), outbound.MetricRequestsBytesReceived, recvd,
+						model.MetricAttribute{Key: outbound.MetricAttrSourceService, Value: srcSvc},
+						model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+					)
+				}
+			}
+
+			if bridgeErr != nil {
 				log.Printf("Tunnel bridge error: %v\n", bridgeErr)
+				span.SetError(bridgeErr, bridgeErr.Error())
+				span.End()
+				recordConnOutcome(destSvc, destNS, "error")
 				return bridgeErr
 			}
+			span.End()
+			recordConnOutcome(destSvc, destNS, "success")
 			return nil
 		}
 
 		release()
 		lastErr = err
 
+		var statusErr *domain.TunnelStatusError
+		if errors.As(err, &statusErr) {
+			span.SetAttributes(model.MetricAttribute{Key: outbound.AttrHTTPStatusCode, Value: strconv.Itoa(statusErr.StatusCode)})
+		}
+		span.SetError(err, err.Error())
+		span.End()
+
 		if !isRetryableRouteError(ctx, err, retryCfg) {
 			log.Printf("Non-retryable HBONE tunnel error to %s (destination %s, nodeServiceID %q): %v\n",
 				resolved.TargetHost, resolved.RealDest, resolved.ServiceID, err)
+			outcome := "error"
 			if errors.Is(err, domain.ErrForbidden) {
+				outcome = "forbidden"
 				respondForbiddenOutbound(ctx, httpBridge, localConn, model.ConnectionMeta{
 					Direction:       model.DirectionOutbound,
 					ConfiguredProto: model.NormalizeProtocol(resolved.Protocol),
@@ -384,6 +568,7 @@ func (s *ClientSideService) tunnelWithRetries(
 					NodeServiceID:   resolved.ServiceID,
 				})
 			}
+			recordConnOutcome(destSvc, destNS, outcome)
 			return err
 		}
 
@@ -395,16 +580,30 @@ func (s *ClientSideService) tunnelWithRetries(
 		excluded = append(excluded, resolved.EndpointKey)
 
 		if attempt >= retryCfg.MaxRetries {
+			if metrics != nil {
+				metrics.AddCounter(ctx, outbound.MetricRetriesExhausted, 1,
+					model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				)
+			}
+			recordConnOutcome(destSvc, destNS, "error")
 			wrapped := fmt.Errorf("%w for %s/%s after %d attempt(s) (tried=%v): %w",
 				domain.ErrRetriesExhausted, resolved.Namespace, resolved.ServiceName, attempt+1, excluded, err)
 			log.Printf("Routing retries exhausted: %v\n", wrapped)
 			return wrapped
 		}
 
+		if metrics != nil {
+			metrics.AddCounter(ctx, outbound.MetricRetriesTotal, 1,
+				model.MetricAttribute{Key: outbound.MetricAttrDestinationService, Value: destSvc},
+				model.MetricAttribute{Key: outbound.MetricAttrRetryReason, Value: classifyRetryReason(err)},
+			)
+		}
+
 		attempt++
 		if retryCfg.BackoffBase > 0 && router.HasAvailableEndpointIPv4(destIP, excluded) {
 			delay := computeRetryBackoff(retryCfg.BackoffBase, retryCfg.BackoffMax, attempt)
 			if !sleepWithContext(ctx, delay) {
+				recordConnOutcome(destSvc, destNS, "error")
 				return ctx.Err()
 			}
 		}
@@ -496,4 +695,49 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func classifyRetryReason(err error) string {
+	var statusErr *domain.TunnelStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode == http.StatusBadGateway {
+			return "502_bad_gateway"
+		}
+		if statusErr.StatusCode >= 500 && statusErr.StatusCode <= 599 {
+			return "5xx"
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "connection_failure"
+}
+
+type countingNetConn struct {
+	net.Conn
+	bytesRead    atomic.Int64
+	bytesWritten atomic.Int64
+}
+
+func (c *countingNetConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.bytesRead.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *countingNetConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.bytesWritten.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *countingNetConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
