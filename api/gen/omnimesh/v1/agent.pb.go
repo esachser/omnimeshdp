@@ -1810,12 +1810,18 @@ func (x *TrafficRouteInfo) GetWeight() int32 {
 }
 
 type AuthzPolicyInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
-	Action        string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"`
-	Source        *SelectorInfo          `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`
-	Destination   *SelectorInfo          `protobuf:"bytes,5,opt,name=destination,proto3" json:"destination,omitempty"`
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Name             string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Namespace        string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Action           string                 `protobuf:"bytes,3,opt,name=action,proto3" json:"action,omitempty"` // "ALLOW", "DENY", "DRY_RUN"
+	Source           *SelectorInfo          `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`
+	Destination      *SelectorInfo          `protobuf:"bytes,5,opt,name=destination,proto3" json:"destination,omitempty"`
+	DestinationPorts []int32                `protobuf:"varint,6,rep,packed,name=destination_ports,json=destinationPorts,proto3" json:"destination_ports,omitempty"`
+	Rules            []*AuthzRuleInfo       `protobuf:"bytes,7,rep,name=rules,proto3" json:"rules,omitempty"`
+	// valid_from is an optional RFC 3339 UTC timestamp when the policy becomes active.
+	ValidFrom string `protobuf:"bytes,8,opt,name=valid_from,json=validFrom,proto3" json:"valid_from,omitempty"`
+	// valid_until is an optional RFC 3339 UTC timestamp when the policy expires.
+	ValidUntil    string `protobuf:"bytes,9,opt,name=valid_until,json=validUntil,proto3" json:"valid_until,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1885,11 +1891,41 @@ func (x *AuthzPolicyInfo) GetDestination() *SelectorInfo {
 	return nil
 }
 
+func (x *AuthzPolicyInfo) GetDestinationPorts() []int32 {
+	if x != nil {
+		return x.DestinationPorts
+	}
+	return nil
+}
+
+func (x *AuthzPolicyInfo) GetRules() []*AuthzRuleInfo {
+	if x != nil {
+		return x.Rules
+	}
+	return nil
+}
+
+func (x *AuthzPolicyInfo) GetValidFrom() string {
+	if x != nil {
+		return x.ValidFrom
+	}
+	return ""
+}
+
+func (x *AuthzPolicyInfo) GetValidUntil() string {
+	if x != nil {
+		return x.ValidUntil
+	}
+	return ""
+}
+
 type SelectorInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
 	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	Labels        map[string]string      `protobuf:"bytes,3,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	SpiffeId      string                 `protobuf:"bytes,4,opt,name=spiffe_id,json=spiffeId,proto3" json:"spiffe_id,omitempty"`
+	TrustDomain   string                 `protobuf:"bytes,5,opt,name=trust_domain,json=trustDomain,proto3" json:"trust_domain,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1945,6 +1981,192 @@ func (x *SelectorInfo) GetLabels() map[string]string {
 	return nil
 }
 
+func (x *SelectorInfo) GetSpiffeId() string {
+	if x != nil {
+		return x.SpiffeId
+	}
+	return ""
+}
+
+func (x *SelectorInfo) GetTrustDomain() string {
+	if x != nil {
+		return x.TrustDomain
+	}
+	return ""
+}
+
+type AuthzRuleInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Http          *HttpAuthzRuleInfo     `protobuf:"bytes,1,opt,name=http,proto3" json:"http,omitempty"`
+	Grpc          *GrpcAuthzRuleInfo     `protobuf:"bytes,2,opt,name=grpc,proto3" json:"grpc,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AuthzRuleInfo) Reset() {
+	*x = AuthzRuleInfo{}
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuthzRuleInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuthzRuleInfo) ProtoMessage() {}
+
+func (x *AuthzRuleInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuthzRuleInfo.ProtoReflect.Descriptor instead.
+func (*AuthzRuleInfo) Descriptor() ([]byte, []int) {
+	return file_omnimesh_v1_agent_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *AuthzRuleInfo) GetHttp() *HttpAuthzRuleInfo {
+	if x != nil {
+		return x.Http
+	}
+	return nil
+}
+
+func (x *AuthzRuleInfo) GetGrpc() *GrpcAuthzRuleInfo {
+	if x != nil {
+		return x.Grpc
+	}
+	return nil
+}
+
+type HttpAuthzRuleInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Methods       []string               `protobuf:"bytes,1,rep,name=methods,proto3" json:"methods,omitempty"`
+	PathPrefixes  []string               `protobuf:"bytes,2,rep,name=path_prefixes,json=pathPrefixes,proto3" json:"path_prefixes,omitempty"`
+	PathExact     []string               `protobuf:"bytes,3,rep,name=path_exact,json=pathExact,proto3" json:"path_exact,omitempty"`
+	Headers       map[string]string      `protobuf:"bytes,4,rep,name=headers,proto3" json:"headers,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HttpAuthzRuleInfo) Reset() {
+	*x = HttpAuthzRuleInfo{}
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HttpAuthzRuleInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HttpAuthzRuleInfo) ProtoMessage() {}
+
+func (x *HttpAuthzRuleInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HttpAuthzRuleInfo.ProtoReflect.Descriptor instead.
+func (*HttpAuthzRuleInfo) Descriptor() ([]byte, []int) {
+	return file_omnimesh_v1_agent_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *HttpAuthzRuleInfo) GetMethods() []string {
+	if x != nil {
+		return x.Methods
+	}
+	return nil
+}
+
+func (x *HttpAuthzRuleInfo) GetPathPrefixes() []string {
+	if x != nil {
+		return x.PathPrefixes
+	}
+	return nil
+}
+
+func (x *HttpAuthzRuleInfo) GetPathExact() []string {
+	if x != nil {
+		return x.PathExact
+	}
+	return nil
+}
+
+func (x *HttpAuthzRuleInfo) GetHeaders() map[string]string {
+	if x != nil {
+		return x.Headers
+	}
+	return nil
+}
+
+type GrpcAuthzRuleInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Services      []string               `protobuf:"bytes,1,rep,name=services,proto3" json:"services,omitempty"`
+	Methods       []string               `protobuf:"bytes,2,rep,name=methods,proto3" json:"methods,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GrpcAuthzRuleInfo) Reset() {
+	*x = GrpcAuthzRuleInfo{}
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GrpcAuthzRuleInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GrpcAuthzRuleInfo) ProtoMessage() {}
+
+func (x *GrpcAuthzRuleInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GrpcAuthzRuleInfo.ProtoReflect.Descriptor instead.
+func (*GrpcAuthzRuleInfo) Descriptor() ([]byte, []int) {
+	return file_omnimesh_v1_agent_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *GrpcAuthzRuleInfo) GetServices() []string {
+	if x != nil {
+		return x.Services
+	}
+	return nil
+}
+
+func (x *GrpcAuthzRuleInfo) GetMethods() []string {
+	if x != nil {
+		return x.Methods
+	}
+	return nil
+}
+
 // EndpointHealthInfo carries health status for a specific service endpoint.
 // Fields are aligned with HealthReport (agent→CP) naming.
 // node_id allows agents to match health to the correct route target_node.
@@ -1965,7 +2187,7 @@ type EndpointHealthInfo struct {
 
 func (x *EndpointHealthInfo) Reset() {
 	*x = EndpointHealthInfo{}
-	mi := &file_omnimesh_v1_agent_proto_msgTypes[24]
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1977,7 +2199,7 @@ func (x *EndpointHealthInfo) String() string {
 func (*EndpointHealthInfo) ProtoMessage() {}
 
 func (x *EndpointHealthInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_omnimesh_v1_agent_proto_msgTypes[24]
+	mi := &file_omnimesh_v1_agent_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1990,7 +2212,7 @@ func (x *EndpointHealthInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndpointHealthInfo.ProtoReflect.Descriptor instead.
 func (*EndpointHealthInfo) Descriptor() ([]byte, []int) {
-	return file_omnimesh_v1_agent_proto_rawDescGZIP(), []int{24}
+	return file_omnimesh_v1_agent_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *EndpointHealthInfo) GetNamespace() string {
@@ -2177,20 +2399,43 @@ const file_omnimesh_v1_agent_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"v\n" +
 	"\x10TrafficRouteInfo\x12J\n" +
 	"\vdestination\x18\x01 \x01(\v2(.omnimesh.v1.TrafficRouteDestinationInfoR\vdestination\x12\x16\n" +
-	"\x06weight\x18\x02 \x01(\x05R\x06weight\"\xcb\x01\n" +
+	"\x06weight\x18\x02 \x01(\x05R\x06weight\"\xea\x02\n" +
 	"\x0fAuthzPolicyInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x16\n" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x121\n" +
 	"\x06source\x18\x04 \x01(\v2\x19.omnimesh.v1.SelectorInfoR\x06source\x12;\n" +
-	"\vdestination\x18\x05 \x01(\v2\x19.omnimesh.v1.SelectorInfoR\vdestination\"\xba\x01\n" +
+	"\vdestination\x18\x05 \x01(\v2\x19.omnimesh.v1.SelectorInfoR\vdestination\x12+\n" +
+	"\x11destination_ports\x18\x06 \x03(\x05R\x10destinationPorts\x120\n" +
+	"\x05rules\x18\a \x03(\v2\x1a.omnimesh.v1.AuthzRuleInfoR\x05rules\x12\x1d\n" +
+	"\n" +
+	"valid_from\x18\b \x01(\tR\tvalidFrom\x12\x1f\n" +
+	"\vvalid_until\x18\t \x01(\tR\n" +
+	"validUntil\"\xfa\x01\n" +
 	"\fSelectorInfo\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12=\n" +
-	"\x06labels\x18\x03 \x03(\v2%.omnimesh.v1.SelectorInfo.LabelsEntryR\x06labels\x1a9\n" +
+	"\x06labels\x18\x03 \x03(\v2%.omnimesh.v1.SelectorInfo.LabelsEntryR\x06labels\x12\x1b\n" +
+	"\tspiffe_id\x18\x04 \x01(\tR\bspiffeId\x12!\n" +
+	"\ftrust_domain\x18\x05 \x01(\tR\vtrustDomain\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe7\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"w\n" +
+	"\rAuthzRuleInfo\x122\n" +
+	"\x04http\x18\x01 \x01(\v2\x1e.omnimesh.v1.HttpAuthzRuleInfoR\x04http\x122\n" +
+	"\x04grpc\x18\x02 \x01(\v2\x1e.omnimesh.v1.GrpcAuthzRuleInfoR\x04grpc\"\xf4\x01\n" +
+	"\x11HttpAuthzRuleInfo\x12\x18\n" +
+	"\amethods\x18\x01 \x03(\tR\amethods\x12#\n" +
+	"\rpath_prefixes\x18\x02 \x03(\tR\fpathPrefixes\x12\x1d\n" +
+	"\n" +
+	"path_exact\x18\x03 \x03(\tR\tpathExact\x12E\n" +
+	"\aheaders\x18\x04 \x03(\v2+.omnimesh.v1.HttpAuthzRuleInfo.HeadersEntryR\aheaders\x1a:\n" +
+	"\fHeadersEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"I\n" +
+	"\x11GrpcAuthzRuleInfo\x12\x1a\n" +
+	"\bservices\x18\x01 \x03(\tR\bservices\x12\x18\n" +
+	"\amethods\x18\x02 \x03(\tR\amethods\"\xe7\x01\n" +
 	"\x12EndpointHealthInfo\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12!\n" +
 	"\fservice_name\x18\x02 \x01(\tR\vserviceName\x12\x1d\n" +
@@ -2235,7 +2480,7 @@ func file_omnimesh_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_omnimesh_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_omnimesh_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_omnimesh_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
 var file_omnimesh_v1_agent_proto_goTypes = []any{
 	(EndpointHealthStatus)(0),           // 0: omnimesh.v1.EndpointHealthStatus
 	(ScopeUpdateType)(0),                // 1: omnimesh.v1.ScopeUpdateType
@@ -2265,44 +2510,48 @@ var file_omnimesh_v1_agent_proto_goTypes = []any{
 	(*TrafficRouteInfo)(nil),            // 25: omnimesh.v1.TrafficRouteInfo
 	(*AuthzPolicyInfo)(nil),             // 26: omnimesh.v1.AuthzPolicyInfo
 	(*SelectorInfo)(nil),                // 27: omnimesh.v1.SelectorInfo
-	(*EndpointHealthInfo)(nil),          // 28: omnimesh.v1.EndpointHealthInfo
-	nil,                                 // 29: omnimesh.v1.RegisterNodeRequest.LabelsEntry
-	nil,                                 // 30: omnimesh.v1.NodeServiceInfo.LabelsEntry
-	nil,                                 // 31: omnimesh.v1.NamespaceInfo.LabelsEntry
-	nil,                                 // 32: omnimesh.v1.NodeEndpointInfo.LabelsEntry
-	nil,                                 // 33: omnimesh.v1.TrafficRouteDestinationInfo.LabelsEntry
-	nil,                                 // 34: omnimesh.v1.SelectorInfo.LabelsEntry
+	(*AuthzRuleInfo)(nil),               // 28: omnimesh.v1.AuthzRuleInfo
+	(*HttpAuthzRuleInfo)(nil),           // 29: omnimesh.v1.HttpAuthzRuleInfo
+	(*GrpcAuthzRuleInfo)(nil),           // 30: omnimesh.v1.GrpcAuthzRuleInfo
+	(*EndpointHealthInfo)(nil),          // 31: omnimesh.v1.EndpointHealthInfo
+	nil,                                 // 32: omnimesh.v1.RegisterNodeRequest.LabelsEntry
+	nil,                                 // 33: omnimesh.v1.NodeServiceInfo.LabelsEntry
+	nil,                                 // 34: omnimesh.v1.NamespaceInfo.LabelsEntry
+	nil,                                 // 35: omnimesh.v1.NodeEndpointInfo.LabelsEntry
+	nil,                                 // 36: omnimesh.v1.TrafficRouteDestinationInfo.LabelsEntry
+	nil,                                 // 37: omnimesh.v1.SelectorInfo.LabelsEntry
+	nil,                                 // 38: omnimesh.v1.HttpAuthzRuleInfo.HeadersEntry
 }
 var file_omnimesh_v1_agent_proto_depIdxs = []int32{
 	5,  // 0: omnimesh.v1.AgentStreamRequest.register_node:type_name -> omnimesh.v1.RegisterNodeRequest
 	6,  // 1: omnimesh.v1.AgentStreamRequest.health_report:type_name -> omnimesh.v1.HealthReport
 	7,  // 2: omnimesh.v1.AgentStreamRequest.update_node_services:type_name -> omnimesh.v1.UpdateNodeServicesRequest
 	8,  // 3: omnimesh.v1.AgentStreamRequest.drain_node:type_name -> omnimesh.v1.DrainNodeRequest
-	29, // 4: omnimesh.v1.RegisterNodeRequest.labels:type_name -> omnimesh.v1.RegisterNodeRequest.LabelsEntry
+	32, // 4: omnimesh.v1.RegisterNodeRequest.labels:type_name -> omnimesh.v1.RegisterNodeRequest.LabelsEntry
 	9,  // 5: omnimesh.v1.RegisterNodeRequest.services:type_name -> omnimesh.v1.NodeServiceInfo
 	0,  // 6: omnimesh.v1.HealthReport.status:type_name -> omnimesh.v1.EndpointHealthStatus
 	9,  // 7: omnimesh.v1.UpdateNodeServicesRequest.added_services:type_name -> omnimesh.v1.NodeServiceInfo
 	9,  // 8: omnimesh.v1.UpdateNodeServicesRequest.removed_services:type_name -> omnimesh.v1.NodeServiceInfo
-	30, // 9: omnimesh.v1.NodeServiceInfo.labels:type_name -> omnimesh.v1.NodeServiceInfo.LabelsEntry
+	33, // 9: omnimesh.v1.NodeServiceInfo.labels:type_name -> omnimesh.v1.NodeServiceInfo.LabelsEntry
 	11, // 10: omnimesh.v1.AgentStreamResponse.scope_snapshot:type_name -> omnimesh.v1.ScopeSnapshot
 	12, // 11: omnimesh.v1.AgentStreamResponse.scope_update:type_name -> omnimesh.v1.ScopeUpdate
 	15, // 12: omnimesh.v1.ScopeSnapshot.services:type_name -> omnimesh.v1.ServiceInfo
 	16, // 13: omnimesh.v1.ScopeSnapshot.routes:type_name -> omnimesh.v1.RouteInfo
 	18, // 14: omnimesh.v1.ScopeSnapshot.traffic_policies:type_name -> omnimesh.v1.TrafficPolicyInfo
 	26, // 15: omnimesh.v1.ScopeSnapshot.authz_policies:type_name -> omnimesh.v1.AuthzPolicyInfo
-	28, // 16: omnimesh.v1.ScopeSnapshot.endpoint_health:type_name -> omnimesh.v1.EndpointHealthInfo
+	31, // 16: omnimesh.v1.ScopeSnapshot.endpoint_health:type_name -> omnimesh.v1.EndpointHealthInfo
 	13, // 17: omnimesh.v1.ScopeSnapshot.namespaces:type_name -> omnimesh.v1.NamespaceInfo
 	1,  // 18: omnimesh.v1.ScopeUpdate.type:type_name -> omnimesh.v1.ScopeUpdateType
 	15, // 19: omnimesh.v1.ScopeUpdate.services:type_name -> omnimesh.v1.ServiceInfo
 	16, // 20: omnimesh.v1.ScopeUpdate.routes:type_name -> omnimesh.v1.RouteInfo
 	18, // 21: omnimesh.v1.ScopeUpdate.traffic_policies:type_name -> omnimesh.v1.TrafficPolicyInfo
-	28, // 22: omnimesh.v1.ScopeUpdate.endpoint_health:type_name -> omnimesh.v1.EndpointHealthInfo
+	31, // 22: omnimesh.v1.ScopeUpdate.endpoint_health:type_name -> omnimesh.v1.EndpointHealthInfo
 	26, // 23: omnimesh.v1.ScopeUpdate.authz_policies:type_name -> omnimesh.v1.AuthzPolicyInfo
 	13, // 24: omnimesh.v1.ScopeUpdate.namespaces:type_name -> omnimesh.v1.NamespaceInfo
-	31, // 25: omnimesh.v1.NamespaceInfo.labels:type_name -> omnimesh.v1.NamespaceInfo.LabelsEntry
+	34, // 25: omnimesh.v1.NamespaceInfo.labels:type_name -> omnimesh.v1.NamespaceInfo.LabelsEntry
 	14, // 26: omnimesh.v1.ServiceInfo.selector_sets:type_name -> omnimesh.v1.SelectorSet
 	17, // 27: omnimesh.v1.RouteInfo.target_nodes:type_name -> omnimesh.v1.NodeEndpointInfo
-	32, // 28: omnimesh.v1.NodeEndpointInfo.labels:type_name -> omnimesh.v1.NodeEndpointInfo.LabelsEntry
+	35, // 28: omnimesh.v1.NodeEndpointInfo.labels:type_name -> omnimesh.v1.NodeEndpointInfo.LabelsEntry
 	19, // 29: omnimesh.v1.TrafficPolicyInfo.retry:type_name -> omnimesh.v1.RetryPolicyInfo
 	20, // 30: omnimesh.v1.TrafficPolicyInfo.circuit_breaker:type_name -> omnimesh.v1.CircuitBreakerPolicyInfo
 	21, // 31: omnimesh.v1.TrafficPolicyInfo.rate_limiter:type_name -> omnimesh.v1.RateLimitPolicyInfo
@@ -2311,19 +2560,23 @@ var file_omnimesh_v1_agent_proto_depIdxs = []int32{
 	25, // 34: omnimesh.v1.TrafficPolicyInfo.routes:type_name -> omnimesh.v1.TrafficRouteInfo
 	2,  // 35: omnimesh.v1.RateLimitPolicyInfo.limit_exceeded_action:type_name -> omnimesh.v1.RateLimitAction
 	3,  // 36: omnimesh.v1.LoadBalancerPolicyInfo.algorithm:type_name -> omnimesh.v1.LoadBalancerAlgorithm
-	33, // 37: omnimesh.v1.TrafficRouteDestinationInfo.labels:type_name -> omnimesh.v1.TrafficRouteDestinationInfo.LabelsEntry
+	36, // 37: omnimesh.v1.TrafficRouteDestinationInfo.labels:type_name -> omnimesh.v1.TrafficRouteDestinationInfo.LabelsEntry
 	24, // 38: omnimesh.v1.TrafficRouteInfo.destination:type_name -> omnimesh.v1.TrafficRouteDestinationInfo
 	27, // 39: omnimesh.v1.AuthzPolicyInfo.source:type_name -> omnimesh.v1.SelectorInfo
 	27, // 40: omnimesh.v1.AuthzPolicyInfo.destination:type_name -> omnimesh.v1.SelectorInfo
-	34, // 41: omnimesh.v1.SelectorInfo.labels:type_name -> omnimesh.v1.SelectorInfo.LabelsEntry
-	0,  // 42: omnimesh.v1.EndpointHealthInfo.status:type_name -> omnimesh.v1.EndpointHealthStatus
-	4,  // 43: omnimesh.v1.AgentService.AgentStream:input_type -> omnimesh.v1.AgentStreamRequest
-	10, // 44: omnimesh.v1.AgentService.AgentStream:output_type -> omnimesh.v1.AgentStreamResponse
-	44, // [44:45] is the sub-list for method output_type
-	43, // [43:44] is the sub-list for method input_type
-	43, // [43:43] is the sub-list for extension type_name
-	43, // [43:43] is the sub-list for extension extendee
-	0,  // [0:43] is the sub-list for field type_name
+	28, // 41: omnimesh.v1.AuthzPolicyInfo.rules:type_name -> omnimesh.v1.AuthzRuleInfo
+	37, // 42: omnimesh.v1.SelectorInfo.labels:type_name -> omnimesh.v1.SelectorInfo.LabelsEntry
+	29, // 43: omnimesh.v1.AuthzRuleInfo.http:type_name -> omnimesh.v1.HttpAuthzRuleInfo
+	30, // 44: omnimesh.v1.AuthzRuleInfo.grpc:type_name -> omnimesh.v1.GrpcAuthzRuleInfo
+	38, // 45: omnimesh.v1.HttpAuthzRuleInfo.headers:type_name -> omnimesh.v1.HttpAuthzRuleInfo.HeadersEntry
+	0,  // 46: omnimesh.v1.EndpointHealthInfo.status:type_name -> omnimesh.v1.EndpointHealthStatus
+	4,  // 47: omnimesh.v1.AgentService.AgentStream:input_type -> omnimesh.v1.AgentStreamRequest
+	10, // 48: omnimesh.v1.AgentService.AgentStream:output_type -> omnimesh.v1.AgentStreamResponse
+	48, // [48:49] is the sub-list for method output_type
+	47, // [47:48] is the sub-list for method input_type
+	47, // [47:47] is the sub-list for extension type_name
+	47, // [47:47] is the sub-list for extension extendee
+	0,  // [0:47] is the sub-list for field type_name
 }
 
 func init() { file_omnimesh_v1_agent_proto_init() }
@@ -2347,7 +2600,7 @@ func file_omnimesh_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_omnimesh_v1_agent_proto_rawDesc), len(file_omnimesh_v1_agent_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   31,
+			NumMessages:   35,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

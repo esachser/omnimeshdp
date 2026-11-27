@@ -3,6 +3,7 @@ package authz
 import (
 	"context"
 	"log"
+	"maps"
 	"net/http"
 	"path"
 	"slices"
@@ -554,17 +555,9 @@ func compileSnapshot(state *rawAuthzState) *authzSnapshot {
 		if ap == nil {
 			continue
 		}
-		action, ok := model.ParseAuthzAction(ap.Action)
+		dp, ok := protoPolicyToModel(ap)
 		if !ok {
-			log.Printf("[Authz] ignoring policy %s/%s with unknown action %q\n", ap.Namespace, ap.Name, ap.Action)
 			continue
-		}
-		dp := model.AuthzPolicy{
-			Name:        ap.Name,
-			Namespace:   ap.Namespace,
-			Action:      action,
-			Source:      protoSelectorToModel(ap.Source),
-			Destination: protoSelectorToModel(ap.Destination),
 		}
 		addCompiled(compileDomainPolicy(dp))
 	}
@@ -624,15 +617,108 @@ func compileSnapshot(state *rawAuthzState) *authzSnapshot {
 	return snap
 }
 
+func protoPolicyToModel(ap *omnimeshv1.AuthzPolicyInfo) (model.AuthzPolicy, bool) {
+	action, ok := model.ParseAuthzAction(ap.Action)
+	if !ok {
+		log.Printf("[Authz] ignoring policy %s/%s with unknown action %q\n", ap.Namespace, ap.Name, ap.Action)
+		return model.AuthzPolicy{}, false
+	}
+
+	validFrom, err := parseOptionalProtoTimestamp(ap.ValidFrom)
+	if err != nil {
+		log.Printf("[Authz] ignoring policy %s/%s with invalid valid_from %q: %v\n", ap.Namespace, ap.Name, ap.ValidFrom, err)
+		return model.AuthzPolicy{}, false
+	}
+
+	validUntil, err := parseOptionalProtoTimestamp(ap.ValidUntil)
+	if err != nil {
+		log.Printf("[Authz] ignoring policy %s/%s with invalid valid_until %q: %v\n", ap.Namespace, ap.Name, ap.ValidUntil, err)
+		return model.AuthzPolicy{}, false
+	}
+
+	if validFrom != nil && validUntil != nil && validFrom.After(*validUntil) {
+		log.Printf("[Authz] ignoring policy %s/%s with valid_from (%s) after valid_until (%s)\n", ap.Namespace, ap.Name, ap.ValidFrom, ap.ValidUntil)
+		return model.AuthzPolicy{}, false
+	}
+
+	return model.AuthzPolicy{
+		Name:             ap.Name,
+		Namespace:        ap.Namespace,
+		Action:           action,
+		Source:           protoSelectorToModel(ap.Source),
+		Destination:      protoSelectorToModel(ap.Destination),
+		DestinationPorts: protoPortsToModel(ap.DestinationPorts),
+		Rules:            protoRulesToModel(ap.Rules),
+		ValidFrom:        validFrom,
+		ValidUntil:       validUntil,
+	}, true
+}
+
 func protoSelectorToModel(sel *omnimeshv1.SelectorInfo) model.AuthzSelector {
 	if sel == nil {
 		return model.AuthzSelector{}
 	}
 	return model.AuthzSelector{
-		Namespace: sel.Namespace,
-		Name:      sel.Name,
-		Labels:    sel.Labels,
+		SpiffeID:    sel.SpiffeId,
+		TrustDomain: sel.TrustDomain,
+		Namespace:   sel.Namespace,
+		Name:        sel.Name,
+		Labels:      maps.Clone(sel.Labels),
 	}
+}
+
+func protoPortsToModel(ports []int32) []int {
+	if len(ports) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, int(p))
+	}
+	return out
+}
+
+func protoRulesToModel(rules []*omnimeshv1.AuthzRuleInfo) []model.AuthzRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]model.AuthzRule, 0, len(rules))
+	for _, r := range rules {
+		if r == nil {
+			continue
+		}
+		var dr model.AuthzRule
+		if r.Http != nil {
+			dr.HTTP = &model.HTTPAuthzRule{
+				Methods:      slices.Clone(r.Http.Methods),
+				PathPrefixes: slices.Clone(r.Http.PathPrefixes),
+				PathExact:    slices.Clone(r.Http.PathExact),
+				Headers:      maps.Clone(r.Http.Headers),
+			}
+		}
+		if r.Grpc != nil {
+			dr.GRPC = &model.GRPCAuthzRule{
+				Services: slices.Clone(r.Grpc.Services),
+				Methods:  slices.Clone(r.Grpc.Methods),
+			}
+		}
+		if dr.HTTP != nil || dr.GRPC != nil {
+			out = append(out, dr)
+		}
+	}
+	return out
+}
+
+func parseOptionalProtoTimestamp(raw string) (*time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, trimmed)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 func compileDomainPolicy(p model.AuthzPolicy) *compiledPolicy {

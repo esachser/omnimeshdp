@@ -512,6 +512,274 @@ func TestEngine_L7HTTPRulesPathNormalizationGRPCAndDeferral(t *testing.T) {
 	}
 }
 
+func TestEngine_ControlPlaneFullPolicyFieldsOnSnapshotAndScopeUpdate(t *testing.T) {
+	ctx := context.Background()
+	clockNow := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+
+	e := mustNewEngine(
+		t,
+		model.DefaultAuthorizationConfig(),
+		authz.WithTrustDomain("omnimesh.local"),
+		authz.WithClock(func() time.Time { return clockNow }),
+	)
+
+	// Apply initial ScopeSnapshot with full AuthzPolicyInfo fields (ports, HTTP/gRPC rules,
+	// spiffe_id, trust_domain, valid_from, valid_until) plus one malformed timestamp policy.
+	e.ApplySnapshot(&omnimeshv1.ScopeSnapshot{
+		AuthzPolicies: []*omnimeshv1.AuthzPolicyInfo{
+			{
+				Name:      "cp-http-policy",
+				Namespace: "prod",
+				Action:    "ALLOW",
+				Source: &omnimeshv1.SelectorInfo{
+					SpiffeId: "spiffe://partner.mesh/ns/external/sa/partner-client",
+				},
+				Destination: &omnimeshv1.SelectorInfo{
+					Namespace: "prod",
+					Name:      "payments",
+				},
+				DestinationPorts: []int32{8443},
+				Rules: []*omnimeshv1.AuthzRuleInfo{
+					{
+						Http: &omnimeshv1.HttpAuthzRuleInfo{
+							Methods:      []string{"POST"},
+							PathPrefixes: []string{"/api/v1/charge"},
+							PathExact:    []string{"/healthz"},
+							Headers:      map[string]string{"x-tenant": "acme"},
+						},
+					},
+				},
+				ValidFrom:  "2026-11-27T11:00:00Z",
+				ValidUntil: "2026-11-27T13:00:00Z",
+			},
+			{
+				Name:      "cp-grpc-policy",
+				Namespace: "prod",
+				Action:    "ALLOW",
+				Source: &omnimeshv1.SelectorInfo{
+					TrustDomain: "federated.mesh",
+					Namespace:   "orders",
+					Name:        "checkout",
+				},
+				Destination: &omnimeshv1.SelectorInfo{
+					Namespace: "prod",
+					Name:      "grpc-pay",
+				},
+				Rules: []*omnimeshv1.AuthzRuleInfo{
+					{
+						Grpc: &omnimeshv1.GrpcAuthzRuleInfo{
+							Services: []string{"payment.v1.PaymentService"},
+							Methods:  []string{"Charge"},
+						},
+					},
+				},
+			},
+			{
+				Name:        "invalid-timestamp-policy",
+				Namespace:   "prod",
+				Action:      "ALLOW",
+				Source:      &omnimeshv1.SelectorInfo{Namespace: "*", Name: "*"},
+				Destination: &omnimeshv1.SelectorInfo{Namespace: "prod", Name: "payments"},
+				ValidFrom:   "not-a-timestamp",
+			},
+		},
+	})
+
+	if got := e.PolicyCount(); got != 2 {
+		t.Fatalf("expected 2 valid compiled policies (ignoring invalid timestamp), got %d", got)
+	}
+
+	partnerID := "spiffe://partner.mesh/ns/external/sa/partner-client"
+
+	// L4 defers to L7 on matching port & SpiffeId.
+	if d := e.AuthorizeConnection(ctx, model.AuthzRequest{
+		CallerIdentity:     partnerID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "payments",
+		DestPort:           8443,
+		DestProtocol:       "http",
+		InboundL7Available: true,
+	}); !d.Allowed || !d.RequiresL7 || d.Reason != model.AuthzReasonExplicitAllowL7Deferred {
+		t.Fatalf("expected L7-deferred allow on matching port and spiffe_id, got %+v", d)
+	}
+
+	// Wrong destination port is denied.
+	if d := e.AuthorizeConnection(ctx, model.AuthzRequest{
+		CallerIdentity:     partnerID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "payments",
+		DestPort:           9090,
+		DestProtocol:       "http",
+		InboundL7Available: true,
+	}); d.Allowed {
+		t.Fatalf("expected denial for non-matching destination port, got %+v", d)
+	}
+
+	// L7 HTTP exact path + header matches.
+	if d := e.AuthorizeHTTP(ctx, model.AuthzRequest{
+		CallerIdentity:     partnerID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "payments",
+		DestPort:           8443,
+		DestProtocol:       "http",
+		InboundL7Available: true,
+		HTTP: &model.HTTPAuthzAttributes{
+			Method:  "POST",
+			Path:    "/healthz",
+			Headers: http.Header{"X-Tenant": {"acme"}},
+		},
+	}); !d.Allowed || d.MatchedPolicy != "prod/cp-http-policy" {
+		t.Fatalf("expected L7 HTTP allow via CP policy, got %+v", d)
+	}
+
+	// L7 HTTP wrong header denied with l7_mismatch.
+	if d := e.AuthorizeHTTP(ctx, model.AuthzRequest{
+		CallerIdentity:     partnerID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "payments",
+		DestPort:           8443,
+		DestProtocol:       "http",
+		InboundL7Available: true,
+		HTTP: &model.HTTPAuthzAttributes{
+			Method:  "POST",
+			Path:    "/api/v1/charge",
+			Headers: http.Header{"X-Tenant": {"other"}},
+		},
+	}); d.Allowed || d.Reason != model.AuthzReasonL7Mismatch {
+		t.Fatalf("expected L7 mismatch for wrong header, got %+v", d)
+	}
+
+	// Federated trust_domain + gRPC rule matches Charge and denies Refund.
+	federatedID := "spiffe://federated.mesh/ns/orders/sa/checkout"
+	if d := e.AuthorizeHTTP(ctx, model.AuthzRequest{
+		CallerIdentity:     federatedID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "grpc-pay",
+		DestProtocol:       "grpc",
+		InboundL7Available: true,
+		HTTP: &model.HTTPAuthzAttributes{
+			Method:      "POST",
+			Path:        "/payment.v1.PaymentService/Charge",
+			IsGRPC:      true,
+			GRPCService: "payment.v1.PaymentService",
+			GRPCMethod:  "Charge",
+		},
+	}); !d.Allowed || d.MatchedPolicy != "prod/cp-grpc-policy" {
+		t.Fatalf("expected federated gRPC Charge allow, got %+v", d)
+	}
+	if d := e.AuthorizeHTTP(ctx, model.AuthzRequest{
+		CallerIdentity:     federatedID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "grpc-pay",
+		DestProtocol:       "grpc",
+		InboundL7Available: true,
+		HTTP: &model.HTTPAuthzAttributes{
+			Method:      "POST",
+			Path:        "/payment.v1.PaymentService/Refund",
+			IsGRPC:      true,
+			GRPCService: "payment.v1.PaymentService",
+			GRPCMethod:  "Refund",
+		},
+	}); d.Allowed || d.Reason != model.AuthzReasonL7Mismatch {
+		t.Fatalf("expected federated gRPC Refund deny with l7_mismatch, got %+v", d)
+	}
+
+	// Temporal expiration stops matching after ValidUntil.
+	clockNow = time.Date(2026, 11, 27, 13, 0, 0, 0, time.UTC)
+	if d := e.AuthorizeHTTP(ctx, model.AuthzRequest{
+		CallerIdentity:     partnerID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "payments",
+		DestPort:           8443,
+		DestProtocol:       "http",
+		InboundL7Available: true,
+		HTTP: &model.HTTPAuthzAttributes{
+			Method:  "POST",
+			Path:    "/healthz",
+			Headers: http.Header{"X-Tenant": {"acme"}},
+		},
+	}); d.Allowed {
+		t.Fatalf("expected expired CP policy to deny, got %+v", d)
+	}
+
+	// ScopeUpdate MODIFY extends ValidUntil, changes port to 9443, and adds GET /status.
+	e.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_MODIFY,
+		AuthzPolicies: []*omnimeshv1.AuthzPolicyInfo{
+			{
+				Name:      "cp-http-policy",
+				Namespace: "prod",
+				Action:    "ALLOW",
+				Source: &omnimeshv1.SelectorInfo{
+					SpiffeId: partnerID,
+				},
+				Destination: &omnimeshv1.SelectorInfo{
+					Namespace: "prod",
+					Name:      "payments",
+				},
+				DestinationPorts: []int32{9443},
+				Rules: []*omnimeshv1.AuthzRuleInfo{
+					{
+						Http: &omnimeshv1.HttpAuthzRuleInfo{
+							Methods:   []string{"GET"},
+							PathExact: []string{"/status"},
+						},
+					},
+				},
+				ValidFrom:  "2026-11-27T11:00:00Z",
+				ValidUntil: "2026-11-27T15:00:00Z",
+			},
+		},
+	})
+
+	if d := e.AuthorizeHTTP(ctx, model.AuthzRequest{
+		CallerIdentity:     partnerID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "payments",
+		DestPort:           9443,
+		DestProtocol:       "http",
+		InboundL7Available: true,
+		HTTP: &model.HTTPAuthzAttributes{
+			Method: "GET",
+			Path:   "/status",
+		},
+	}); !d.Allowed || d.MatchedPolicy != "prod/cp-http-policy" {
+		t.Fatalf("expected updated CP policy on port 9443 GET /status to allow, got %+v", d)
+	}
+
+	// ScopeUpdate REMOVE revokes the policy.
+	e.ApplyUpdate(&omnimeshv1.ScopeUpdate{
+		Type: omnimeshv1.ScopeUpdateType_SCOPE_UPDATE_TYPE_REMOVE,
+		AuthzPolicies: []*omnimeshv1.AuthzPolicyInfo{
+			{Name: "cp-http-policy", Namespace: "prod"},
+		},
+	})
+
+	if d := e.AuthorizeHTTP(ctx, model.AuthzRequest{
+		CallerIdentity:     partnerID,
+		CallerVerified:     true,
+		DestNamespace:      "prod",
+		DestServiceName:    "payments",
+		DestPort:           9443,
+		DestProtocol:       "http",
+		InboundL7Available: true,
+		HTTP: &model.HTTPAuthzAttributes{
+			Method: "GET",
+			Path:   "/status",
+		},
+	}); d.Allowed || d.Reason != model.AuthzReasonNoPolicy {
+		t.Fatalf("expected denial after ScopeUpdate REMOVE, got %+v", d)
+	}
+}
+
 func TestEngine_ConcurrencyRace(t *testing.T) {
 	e := mustNewEngine(t, model.DefaultAuthorizationConfig(), authz.WithTrustDomain("omnimesh.local"))
 	ctx := context.Background()

@@ -17,18 +17,17 @@ This document specifies how **OmniMeshDP** evaluates and enforces service-to-ser
    - Before the initial `ScopeSnapshot` arrives (Orchestrator Step 5), the authorization engine initializes immediately in its configured mode (`strict` by default), denying unauthorized traffic rather than failing open.
    - If the control plane stream disconnects, OmniMeshDP retains its last-known-good atomic authorization snapshot uninterrupted (`internal/application/agent/control_plane.go`) and replaces it atomically upon reconnect.
 
-### Reconciling RFC-0004 with the Live `omnimesh.v1` Agent Stream
+### Alignment with the Live `omnimesh.v1` Agent Stream
 
-While RFC-0004 sketches high-level `AuthzPeer` (`SpiffeID`, `Namespace`, `TrustDomain`), `AuthzTarget` (`ServiceID`, `Ports`), L7 `AuthzRule` (`HTTP`, `GRPC`), temporal bounds (`ValidFrom`, `ValidUntil`), and `AuthzDryRun`, the live `omnimesh.v1` protobuf contract (`agent.proto`) currently delivers:
+The live `omnimesh.v1` protobuf contract (`agent.proto`) delivers the full RFC-0004 authorization policy model:
 
-- `AuthzPolicyInfo`: `name`, `namespace`, `action` (`"ALLOW"`, `"DENY"`, or `"DRY_RUN"`), `source` (`SelectorInfo{namespace, name, labels}`), and `destination` (`SelectorInfo{namespace, name, labels}`).
+- `AuthzPolicyInfo`: `name`, `namespace`, `action` (`"ALLOW"`, `"DENY"`, or `"DRY_RUN"`), `source`, `destination`, `destination_ports`, `rules` (`AuthzRuleInfo{http, grpc}`), `valid_from`, and `valid_until`.
+- `SelectorInfo`: `namespace`, `name`, `labels`, `spiffe_id`, and `trust_domain`.
 - `NamespaceInfo`: `name`, `cidr`, `subnets`, `isolation` (`"strict"` or `"open"`), and `labels`.
 - `ServiceInfo`: `namespace`, `name`, `protocol`, `mesh_addr`, `port`, and `selector_sets`.
 - `RouteInfo`: `namespace`, `service_name`, and `target_nodes[]` (`NodeEndpointInfo{node_id, addr, route_name, target, target_address, labels, id}`).
 
-OmniMeshDP bridges both cleanly:
-- It ingests all `ScopeSnapshot` and `ScopeUpdate` messages directly from `omnimesh.v1` today without modifying `omnimeshcontrol`.
-- Its domain model (`model.AuthzPolicy`) and engine already support the full RFC-0004 feature set (`SpiffeID`, `TrustDomain`, `DestinationPorts`, `HTTPAuthzRule`, `GRPCAuthzRule`, `ValidFrom`/`ValidUntil`, and `DRY_RUN`), usable immediately via local bootstrap/fallback policies (`authorization.local_policies`) and ready for future protobuf extensions.
+OmniMeshDP ingests all of these fields directly from `ScopeSnapshot` and `ScopeUpdate` messages as well as local bootstrap/fallback policies (`authorization.local_policies`).
 
 ---
 
@@ -40,8 +39,8 @@ OmniMeshDP receives authorization state over the persistent bidirectional `Agent
 |---|---|---|
 | `ScopeSnapshot` | `authz_policies`, `namespaces`, `services`, `routes` | Full atomic state replacement at startup (Step 5) and on control plane reconnection. |
 | `ScopeUpdate` | `type` (`ADD`, `MODIFY`, `REMOVE`), `authz_policies`, `namespaces`, `services`, `routes` | Incremental differential updates applied during steady state (Step 9). |
-| `AuthzPolicyInfo` | `name`, `namespace`, `action`, `source`, `destination` | Service-to-service `ALLOW` / `DENY` / `DRY_RUN` policies scoped to the agent. |
-| `SelectorInfo` | `namespace`, `name` (`"*"` or `""` = wildcard), `labels` | Source and destination selectors (AND logic across `labels`). |
+| `AuthzPolicyInfo` | `name`, `namespace`, `action`, `source`, `destination`, `destination_ports`, `rules`, `valid_from`, `valid_until` | Service-to-service `ALLOW` / `DENY` / `DRY_RUN` policies scoped to the agent, including ports, L7 HTTP/gRPC rules, and temporal windows. |
+| `SelectorInfo` | `namespace`, `name` (`"*"` or `""` = wildcard), `labels`, `spiffe_id`, `trust_domain` | Source and destination selectors (AND logic across `labels`, plus optional exact SPIFFE ID or trust domain). |
 | `NamespaceInfo` | `name`, `isolation` (`"strict"` / `"open"`) | Controls intra-namespace default behavior when no explicit `DENY` or `ALLOW` matches. |
 | `ServiceInfo` | `namespace`, `name`, `protocol`, `mesh_addr`, `port` | Resolves `(namespace, service_name, protocol)` from `x-omnimesh-real-dest` IP when `x-omnimesh-node-service-id` is absent or local service JSON omits `protocol`. |
 | `RouteInfo` | `namespace`, `service_name`, `target_nodes[]` (`node_id`, `labels`) | Supplies source workload labels (`Source.Labels`) indexed by `(namespace, service_name, node_id)` with fallback to `(namespace, service_name)`. |
